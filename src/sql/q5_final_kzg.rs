@@ -1332,12 +1332,36 @@ mod tests {
             }
         }
 
-        let customer_file_path = "/home/cc/halo2-TPCH/src/data/customer.tbl";
-        let orders_file_path = "/home/cc/halo2-TPCH/src/data/orders.tbl";
-        let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem.tbl";
-        let supplier_file_path = "/home/cc/halo2-TPCH/src/data/supplier.tbl";
-        let nation_file_path = "/home/cc/halo2-TPCH/src/data/nation.tbl";
-        let region_file_path = "/home/cc/halo2-TPCH/src/data/region.cvs";
+        let customer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join("customer.tbl");
+        let orders_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join("orders.tbl");
+        let lineitem_filename = match k {
+            16 => "lineitem.tbl",
+            17 => "lineitem_120K.tbl",
+            18 => "lineitem_240K.tbl",
+            _ => panic!("no lineitem file mapping for k={k}"),
+        };
+        let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join(lineitem_filename);
+        let supplier_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join("supplier.tbl");
+        let nation_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join("nation.tbl");
+        let region_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join("region.cvs");
 
         let mut customer: Vec<Vec<u64>> = Vec::new();
         let mut orders: Vec<Vec<u64>> = Vec::new();
@@ -1346,67 +1370,143 @@ mod tests {
         let mut nation: Vec<Vec<u64>> = Vec::new();
         let mut regions: Vec<Vec<u64>> = Vec::new();
 
-        if let Ok(records) = data_processing::customer_read_records_from_file(customer_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            customer = records
-                .iter()
-                .map(|record| vec![record.c_custkey, record.c_nationkey])
-                .collect();
+        println!("customer_file_path: {}", customer_path.display());
+        println!("customer_file_exists: {}", customer_path.exists());
+        if let Ok(meta) = std::fs::metadata(&customer_path) {
+            println!("customer_file_size_bytes: {}", meta.len());
+        } else {
+            println!("customer_file_size_bytes: <unavailable>");
         }
-        if let Ok(records) = data_processing::orders_read_records_from_file(orders_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            orders = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        date_to_timestamp(&record.o_orderdate),
-                        record.o_custkey,
-                        record.o_orderkey,
-                    ]
-                })
-                .collect();
+        let read_start = Instant::now();
+        let customer_records = data_processing::customer_read_records_from_file(
+            customer_path.to_str().unwrap(),
+        )
+        .expect("failed to read customer file");
+        customer = customer_records
+            .iter()
+            .map(|record| vec![record.c_custkey, record.c_nationkey])
+            .collect();
+        println!("customer_records_loaded: {}", customer.len());
+        println!("customer_read_ms: {:?}", read_start.elapsed());
+
+        println!("orders_file_path: {}", orders_path.display());
+        println!("orders_file_exists: {}", orders_path.exists());
+        if let Ok(meta) = std::fs::metadata(&orders_path) {
+            println!("orders_file_size_bytes: {}", meta.len());
+        } else {
+            println!("orders_file_size_bytes: <unavailable>");
         }
-        if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            lineitem = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        record.l_orderkey,
-                        scale_by_1000(record.l_extendedprice),
-                        scale_by_1000(record.l_discount),
-                        record.l_suppkey,
-                    ]
-                })
-                .collect();
+        let read_start = Instant::now();
+        let orders_records = data_processing::orders_read_records_from_file(
+            orders_path.to_str().unwrap(),
+        )
+        .expect("failed to read orders file");
+        orders = orders_records
+            .iter()
+            .map(|record| {
+                vec![
+                    date_to_timestamp(&record.o_orderdate),
+                    record.o_custkey,
+                    record.o_orderkey,
+                ]
+            })
+            .collect();
+        println!("orders_records_loaded: {}", orders.len());
+        println!("orders_read_ms: {:?}", read_start.elapsed());
+
+        println!("lineitem_file_path: {}", lineitem_path.display());
+        println!("lineitem_file_exists: {}", lineitem_path.exists());
+        if let Ok(meta) = std::fs::metadata(&lineitem_path) {
+            println!("lineitem_file_size_bytes: {}", meta.len());
+        } else {
+            println!("lineitem_file_size_bytes: <unavailable>");
         }
-        if let Ok(records) = data_processing::supplier_read_records_from_file(supplier_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            supplier = records
-                .iter()
-                .map(|record| vec![record.s_nationkey, record.s_suppkey])
-                .collect();
+        let read_start = Instant::now();
+        let lineitem_records = data_processing::lineitem_read_records_from_file(
+            lineitem_path.to_str().unwrap(),
+        )
+        .expect("failed to read lineitem file");
+        lineitem = lineitem_records
+            .iter()
+            .map(|record| {
+                vec![
+                    record.l_orderkey,
+                    scale_by_1000(record.l_extendedprice),
+                    scale_by_1000(record.l_discount),
+                    record.l_suppkey,
+                ]
+            })
+            .collect();
+        println!("lineitem_records_loaded: {}", lineitem.len());
+        if let Some(first) = lineitem.first() {
+            println!("lineitem_record_width: {}", first.len());
+        } else {
+            println!("lineitem_record_width: 0");
         }
-        if let Ok(records) = data_processing::nation_read_records_from_file(nation_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            nation = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        record.n_nationkey,
-                        record.n_regionkey,
-                        string_to_u64(&record.n_name),
-                    ]
-                })
-                .collect();
+        println!("lineitem_read_ms: {:?}", read_start.elapsed());
+
+        println!("supplier_file_path: {}", supplier_path.display());
+        println!("supplier_file_exists: {}", supplier_path.exists());
+        if let Ok(meta) = std::fs::metadata(&supplier_path) {
+            println!("supplier_file_size_bytes: {}", meta.len());
+        } else {
+            println!("supplier_file_size_bytes: <unavailable>");
         }
-        if let Ok(records) = data_processing::region_read_records_from_csv(region_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            regions = records
-                .iter()
-                .map(|record| vec![record.r_regionkey, string_to_u64(&record.r_name)])
-                .collect();
+        let read_start = Instant::now();
+        let supplier_records = data_processing::supplier_read_records_from_file(
+            supplier_path.to_str().unwrap(),
+        )
+        .expect("failed to read supplier file");
+        supplier = supplier_records
+            .iter()
+            .map(|record| vec![record.s_nationkey, record.s_suppkey])
+            .collect();
+        println!("supplier_records_loaded: {}", supplier.len());
+        println!("supplier_read_ms: {:?}", read_start.elapsed());
+
+        println!("nation_file_path: {}", nation_path.display());
+        println!("nation_file_exists: {}", nation_path.exists());
+        if let Ok(meta) = std::fs::metadata(&nation_path) {
+            println!("nation_file_size_bytes: {}", meta.len());
+        } else {
+            println!("nation_file_size_bytes: <unavailable>");
         }
+        let read_start = Instant::now();
+        let nation_records = data_processing::nation_read_records_from_file(
+            nation_path.to_str().unwrap(),
+        )
+        .expect("failed to read nation file");
+        nation = nation_records
+            .iter()
+            .map(|record| {
+                vec![
+                    record.n_nationkey,
+                    record.n_regionkey,
+                    string_to_u64(&record.n_name),
+                ]
+            })
+            .collect();
+        println!("nation_records_loaded: {}", nation.len());
+        println!("nation_read_ms: {:?}", read_start.elapsed());
+
+        println!("region_file_path: {}", region_path.display());
+        println!("region_file_exists: {}", region_path.exists());
+        if let Ok(meta) = std::fs::metadata(&region_path) {
+            println!("region_file_size_bytes: {}", meta.len());
+        } else {
+            println!("region_file_size_bytes: <unavailable>");
+        }
+        let read_start = Instant::now();
+        let region_records = data_processing::region_read_records_from_csv(
+            region_path.to_str().unwrap(),
+        )
+        .expect("failed to read region file");
+        regions = region_records
+            .iter()
+            .map(|record| vec![record.r_regionkey, string_to_u64(&record.r_name)])
+            .collect();
+        println!("region_records_loaded: {}", regions.len());
+        println!("region_read_ms: {:?}", read_start.elapsed());
 
         let condition = vec![
             string_to_u64("EUROPE"),
@@ -1434,8 +1534,14 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home/cc/halo2-TPCH/src/sql/kzg_proof_q5";
-            full_prover(circuit, k, &public_input, proof_path)
+            let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("sql")
+                .join(format!("proof_q5_k{k}"));
+            if let Some(parent) = proof_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            full_prover(circuit, k, &public_input, proof_path.to_str().unwrap())
         }
     }
 }

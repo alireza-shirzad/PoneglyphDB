@@ -632,12 +632,17 @@ mod tests {
         proof_path: &str,
     ) {
         // Time to generate parameters
-        // let params_time_start = Instant::now();
-        // let params: ParamsIPA<vesta::Affine> = ParamsIPA::new(k);
-        let params_path = "/home/cc/halo2-TPCH/src/sql/param16";
-        // let mut fd = std::fs::File::create(&params_path).unwrap();
-        // params.write(&mut fd).unwrap();
-        // println!("Time to generate params {:?}", params_time_start.elapsed());
+        let params_time_start = Instant::now();
+        let params_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("sql")
+            .join(format!("param{k}"));
+        if !params_path.exists() {
+            let params: ParamsIPA<vesta::Affine> = ParamsIPA::new(k);
+            let mut fd = std::fs::File::create(&params_path).unwrap();
+            params.write(&mut fd).unwrap();
+            println!("Time to generate params {:?}", params_time_start.elapsed());
+        }
 
         // read params
         let mut fd = std::fs::File::open(&params_path).unwrap();
@@ -658,6 +663,7 @@ mod tests {
         // Proof generation
         let mut rng = OsRng;
         let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
+        let prove_start = Instant::now();
         create_proof::<IPACommitmentScheme<_>, ProverIPA<_>, _, _, _, _>(
             &params,
             &pk,
@@ -667,6 +673,7 @@ mod tests {
             &mut transcript,
         )
         .expect("proof generation should not fail");
+        println!("prove_time: {:?}", prove_start.elapsed());
         let proof = transcript.finalize();
 
         // Write proof to file
@@ -678,6 +685,7 @@ mod tests {
 
         // Proof verification
         let strategy = SingleStrategy::new(&params);
+        let verify_start = Instant::now();
         let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
         assert!(
             verify_proof(
@@ -690,6 +698,7 @@ mod tests {
             .is_ok(),
             "Proof verification failed"
         );
+        println!("verify_time: {:?}", verify_start.elapsed());
     }
 
     #[test]
@@ -722,24 +731,24 @@ mod tests {
 
         let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem.tbl";
 
-        if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
-            // Convert the Vec<Region> to a 2D vector
-            lineitem = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        Fp::from(record.l_quantity),
-                        Fp::from(scale_by_1000(record.l_extendedprice)),
-                        Fp::from(scale_by_1000(record.l_discount)),
-                        Fp::from(scale_by_1000(record.l_tax)),
-                        Fp::from(string_to_u64(&record.l_returnflag)),
-                        Fp::from(string_to_u64(&record.l_linestatus)),
-                        Fp::from(date_to_timestamp(&record.l_shipdate)),
-                        // Fp::from(string_to_u64(&record.l_shipdate)),
-                    ]
-                })
-                .collect();
-        }
+        // if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
+        //     // Convert the Vec<Region> to a 2D vector
+        //     lineitem = records
+        //         .iter()
+        //         .map(|record| {
+        //             vec![
+        //                 Fp::from(record.l_quantity),
+        //                 Fp::from(scale_by_1000(record.l_extendedprice)),
+        //                 Fp::from(scale_by_1000(record.l_discount)),
+        //                 Fp::from(scale_by_1000(record.l_tax)),
+        //                 Fp::from(string_to_u64(&record.l_returnflag)),
+        //                 Fp::from(string_to_u64(&record.l_linestatus)),
+        //                 Fp::from(date_to_timestamp(&record.l_shipdate)),
+        //                 // Fp::from(string_to_u64(&record.l_shipdate)),
+        //             ]
+        //         })
+        //         .collect();
+        // }
 
         // let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem_120K.tbl";
         // if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
@@ -761,25 +770,53 @@ mod tests {
         //         .collect();
         // }
 
-        // let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem_240K.tbl";
-        // if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
-        //     // Convert the Vec<Region> to a 2D vector
-        //     lineitem = records
-        //         .iter()
-        //         .map(|record| {
-        //             vec![
-        //                 Fp::from(record.l_quantity),
-        //                 Fp::from(scale_by_1000(record.l_extendedprice)),
-        //                 Fp::from(scale_by_1000(record.l_discount)),
-        //                 Fp::from(scale_by_1000(record.l_tax)),
-        //                 Fp::from(string_to_u64(&record.l_returnflag)),
-        //                 Fp::from(string_to_u64(&record.l_linestatus)),
-        //                 Fp::from(date_to_timestamp(&record.l_shipdate)),
-        //                 // Fp::from(string_to_u64(&record.l_shipdate)),
-        //             ]
-        //         })
-        //         .collect();
-        // }
+        let lineitem_filename = match k {
+            16 => "lineitem.tbl",
+            17 => "lineitem_120K.tbl",
+            18 => "lineitem_240K.tbl",
+            _ => panic!("no lineitem file mapping for k={k}"),
+        };
+        let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join(lineitem_filename);
+        println!("lineitem_file_path: {}", lineitem_path.display());
+        println!("lineitem_file_exists: {}", lineitem_path.exists());
+        if let Ok(meta) = std::fs::metadata(&lineitem_path) {
+            println!("lineitem_file_size_bytes: {}", meta.len());
+        } else {
+            println!("lineitem_file_size_bytes: <unavailable>");
+        }
+        let read_start = Instant::now();
+        let records = data_processing::lineitem_read_records_from_file(
+            lineitem_path.to_str().unwrap(),
+        )
+        .expect("failed to read lineitem file");
+        {
+            // Convert the Vec<Region> to a 2D vector
+            lineitem = records
+                .iter()
+                .map(|record| {
+                    vec![
+                        Fp::from(record.l_quantity),
+                        Fp::from(scale_by_1000(record.l_extendedprice)),
+                        Fp::from(scale_by_1000(record.l_discount)),
+                        Fp::from(scale_by_1000(record.l_tax)),
+                        Fp::from(string_to_u64(&record.l_returnflag)),
+                        Fp::from(string_to_u64(&record.l_linestatus)),
+                        Fp::from(date_to_timestamp(&record.l_shipdate)),
+                        // Fp::from(string_to_u64(&record.l_shipdate)),
+                    ]
+                })
+                .collect();
+            println!("lineitem_records_loaded: {}", lineitem.len());
+            if let Some(first) = lineitem.first() {
+                println!("lineitem_record_width: {}", first.len());
+            } else {
+                println!("lineitem_record_width: 0");
+            }
+        }
+        println!("lineitem_read_ms: {:?}", read_start.elapsed());
 
         let right_shipdate = Fp::from(902102400);
         // l_shipdate <= date '1998-08-03'
@@ -804,8 +841,14 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home/cc/halo2-TPCH/src/sql/proof_q1";
-            generate_and_verify_proof(k, circuit, &public_input, proof_path);
+            let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("sql")
+                .join("proof_q1");
+            if let Some(parent) = proof_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            generate_and_verify_proof(k, circuit, &public_input, proof_path.to_str().unwrap());
         }
     }
 }

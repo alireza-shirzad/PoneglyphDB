@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn test_1() {
-        let k = 16;
+        let k = 18;
 
         fn string_to_u64(s: &str) -> u64 {
             let mut result = 0;
@@ -686,11 +686,30 @@ mod tests {
             }
         }
 
-        // let lineitem_file_path = "/Users/binbingu/halo2-TPCH/src/data/lineitem.tbl";
-        let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem.tbl";
+        let lineitem_filename = match k {
+            16 => "lineitem.tbl",
+            17 => "lineitem_120K.tbl",
+            18 => "lineitem_240K.tbl",
+            _ => panic!("no lineitem file mapping for k={k}"),
+        };
+        let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("data")
+            .join(lineitem_filename);
+        println!("lineitem_file_path: {}", lineitem_path.display());
+        println!("lineitem_file_exists: {}", lineitem_path.exists());
+        if let Ok(meta) = std::fs::metadata(&lineitem_path) {
+            println!("lineitem_file_size_bytes: {}", meta.len());
+        } else {
+            println!("lineitem_file_size_bytes: <unavailable>");
+        }
         let mut lineitem: Vec<Vec<Fp>> = Vec::new();
-
-        if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
+        let read_start = Instant::now();
+        let records = data_processing::lineitem_read_records_from_file(
+            lineitem_path.to_str().unwrap(),
+        )
+        .expect("failed to read lineitem file");
+        {
             // Convert the Vec<Region> to a 2D vector
             lineitem = records
                 .iter()
@@ -707,7 +726,14 @@ mod tests {
                     ]
                 })
                 .collect();
+            println!("lineitem_records_loaded: {}", lineitem.len());
+            if let Some(first) = lineitem.first() {
+                println!("lineitem_record_width: {}", first.len());
+            } else {
+                println!("lineitem_record_width: 0");
+            }
         }
+        println!("lineitem_read_ms: {:?}", read_start.elapsed());
         // println!("lineitem length: {:?}", lineitem[0]);
 
         let right_shipdate = Fp::from(902102400);
@@ -738,7 +764,13 @@ mod tests {
         // }
         // let prover = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         // prover.assert_satisfied();
-        let proof_path = "/home/cc/halo2-TPCH/src/sql/kzg_proof_q1";
-        full_prover(circuit, k, &public_input, proof_path)
+        let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("sql")
+            .join(format!("proof_q1_k{k}"));
+        if let Some(parent) = proof_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        full_prover(circuit, k, &public_input, proof_path.to_str().unwrap())
     }
 }
