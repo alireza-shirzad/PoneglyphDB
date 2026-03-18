@@ -63,6 +63,7 @@ pub fn full_prover<C: Circuit<Fp>>(circuit: C, k: u32, public_input: &[Fp], proo
     .expect("prover should not fail");
     let proof = transcript.finalize();
     println!("prove_time: {:?}", proof_time_start.elapsed());
+    println!("proof_size_bytes: {}", proof.len());
 
     File::create(Path::new(proof_path))
         .expect("Failed to create proof file")
