@@ -627,150 +627,118 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// External benchmark entry point. Runs Q1 at the given Halo2 degree `k`
+/// (16/17/18 ↔ 60K/120K/240K lineitem rows) and returns prover/verifier
+/// timing and proof size. The unit test [`tests::test_1`] is a thin wrapper
+/// around this function so benches can call it without going through
+/// `cargo test`.
+pub fn run(k: u32) -> crate::circuits::utils::BenchResult {
     use crate::circuits::utils::full_prover;
-
-    use super::MyCircuit;
-    // use rand::Rng;
-    // use halo2_proofs::poly::commitment::Params
     use crate::data::data_processing;
     use chrono::{DateTime, NaiveDate, Utc};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::halo2curves::bn256::Fr as Fp;
     use std::marker::PhantomData;
-
-    use halo2_proofs::{
-        halo2curves::bn256::{Bn256, Fr as Fp, G1Affine},
-        plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
-        poly::{
-            commitment::ParamsProver,
-            kzg::{
-                commitment::{KZGCommitmentScheme, ParamsKZG},
-                multiopen::{ProverSHPLONK, VerifierSHPLONK},
-                strategy::SingleStrategy,
-            },
-        },
-        transcript::{
-            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
-        },
-    };
-    use rand::rngs::OsRng;
-    use std::process;
     use std::time::Instant;
-    use std::{fs::File, io::Write, path::Path};
 
+    fn string_to_u64(s: &str) -> u64 {
+        let mut result = 0;
+
+        for (i, c) in s.chars().enumerate() {
+            result += (i as u64 + 1) * (c as u64);
+        }
+
+        result
+    }
+    fn scale_by_1000(x: f64) -> u64 {
+        (1000.0 * x) as u64
+    }
+    fn date_to_timestamp(date_str: &str) -> u64 {
+        match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            Ok(date) => {
+                let datetime: DateTime<Utc> =
+                    DateTime::<Utc>::from_utc(date.and_hms(0, 0, 0), Utc);
+                datetime.timestamp() as u64
+            }
+            Err(_) => 0, // Return a default value like 0 in case of an error
+        }
+    }
+
+    let lineitem_filename = match k {
+        16 => "lineitem.tbl",
+        17 => "lineitem_120K.tbl",
+        18 => "lineitem_240K.tbl",
+        _ => panic!("no lineitem file mapping for k={k}"),
+    };
+    let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("data")
+        .join(lineitem_filename);
+    println!("lineitem_file_path: {}", lineitem_path.display());
+    println!("lineitem_file_exists: {}", lineitem_path.exists());
+    if let Ok(meta) = std::fs::metadata(&lineitem_path) {
+        println!("lineitem_file_size_bytes: {}", meta.len());
+    } else {
+        println!("lineitem_file_size_bytes: <unavailable>");
+    }
+    let lineitem: Vec<Vec<Fp>>;
+    let read_start = Instant::now();
+    let records = data_processing::lineitem_read_records_from_file(
+        lineitem_path.to_str().unwrap(),
+    )
+    .expect("failed to read lineitem file");
+    {
+        // Convert the Vec<Region> to a 2D vector
+        lineitem = records
+            .iter()
+            .map(|record| {
+                vec![
+                    Fp::from(record.l_quantity),
+                    Fp::from(scale_by_1000(record.l_extendedprice)),
+                    Fp::from(scale_by_1000(record.l_discount)),
+                    Fp::from(scale_by_1000(record.l_tax)),
+                    Fp::from(string_to_u64(&record.l_returnflag)),
+                    Fp::from(string_to_u64(&record.l_linestatus)),
+                    Fp::from(date_to_timestamp(&record.l_shipdate)),
+                    // Fp::from(string_to_u64(&record.l_shipdate)),
+                ]
+            })
+            .collect();
+        println!("lineitem_records_loaded: {}", lineitem.len());
+        if let Some(first) = lineitem.first() {
+            println!("lineitem_record_width: {}", first.len());
+        } else {
+            println!("lineitem_record_width: 0");
+        }
+    }
+    println!("lineitem_read_ms: {:?}", read_start.elapsed());
+
+    let right_shipdate = Fp::from(902102400);
+    // l_shipdate <= date '1998-08-03'
+
+    let circuit = MyCircuit::<Fp> {
+        lineitem,
+
+        right_shipdate,
+
+        _marker: PhantomData,
+    };
+
+    let public_input = vec![Fp::from(1)];
+
+    let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("sql")
+        .join(format!("proof_q1_k{k}"));
+    if let Some(parent) = proof_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    full_prover(circuit, k, &public_input, proof_path.to_str().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
     #[test]
     fn test_1() {
-        let k = 18;
-
-        fn string_to_u64(s: &str) -> u64 {
-            let mut result = 0;
-
-            for (i, c) in s.chars().enumerate() {
-                result += (i as u64 + 1) * (c as u64);
-            }
-
-            result
-        }
-        fn scale_by_1000(x: f64) -> u64 {
-            (1000.0 * x) as u64
-        }
-        fn date_to_timestamp(date_str: &str) -> u64 {
-            match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                Ok(date) => {
-                    let datetime: DateTime<Utc> =
-                        DateTime::<Utc>::from_utc(date.and_hms(0, 0, 0), Utc);
-                    datetime.timestamp() as u64
-                }
-                Err(_) => 0, // Return a default value like 0 in case of an error
-            }
-        }
-
-        let lineitem_filename = match k {
-            16 => "lineitem.tbl",
-            17 => "lineitem_120K.tbl",
-            18 => "lineitem_240K.tbl",
-            _ => panic!("no lineitem file mapping for k={k}"),
-        };
-        let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("data")
-            .join(lineitem_filename);
-        println!("lineitem_file_path: {}", lineitem_path.display());
-        println!("lineitem_file_exists: {}", lineitem_path.exists());
-        if let Ok(meta) = std::fs::metadata(&lineitem_path) {
-            println!("lineitem_file_size_bytes: {}", meta.len());
-        } else {
-            println!("lineitem_file_size_bytes: <unavailable>");
-        }
-        let mut lineitem: Vec<Vec<Fp>> = Vec::new();
-        let read_start = Instant::now();
-        let records = data_processing::lineitem_read_records_from_file(
-            lineitem_path.to_str().unwrap(),
-        )
-        .expect("failed to read lineitem file");
-        {
-            // Convert the Vec<Region> to a 2D vector
-            lineitem = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        Fp::from(record.l_quantity),
-                        Fp::from(scale_by_1000(record.l_extendedprice)),
-                        Fp::from(scale_by_1000(record.l_discount)),
-                        Fp::from(scale_by_1000(record.l_tax)),
-                        Fp::from(string_to_u64(&record.l_returnflag)),
-                        Fp::from(string_to_u64(&record.l_linestatus)),
-                        Fp::from(date_to_timestamp(&record.l_shipdate)),
-                        // Fp::from(string_to_u64(&record.l_shipdate)),
-                    ]
-                })
-                .collect();
-            println!("lineitem_records_loaded: {}", lineitem.len());
-            if let Some(first) = lineitem.first() {
-                println!("lineitem_record_width: {}", first.len());
-            } else {
-                println!("lineitem_record_width: 0");
-            }
-        }
-        println!("lineitem_read_ms: {:?}", read_start.elapsed());
-        // println!("lineitem length: {:?}", lineitem[0]);
-
-        let right_shipdate = Fp::from(902102400);
-        // l_shipdate <= date '1998-08-03'
-        // let right_shipdate = Fp::from(2730);
-
-        // let lineitem: Vec<Vec<Fp>> = lineitem.iter().take(100).cloned().collect();
-
-        let circuit = MyCircuit::<Fp> {
-            lineitem,
-
-            right_shipdate,
-
-            _marker: PhantomData,
-        };
-
-        let public_input = vec![Fp::from(1)];
-
-        // // let test = true;
-        // let test = false;
-
-        // if test {
-        //     let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
-        //     prover.assert_satisfied();
-        // } else {
-        //     let proof_path = "/home/cc/halo2-TPCH/src/sql/proof_q1";
-        //     generate_and_verify_proof(k, circuit, &public_input, proof_path);
-        // }
-        // let prover = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
-        // prover.assert_satisfied();
-        let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("sql")
-            .join(format!("proof_q1_k{k}"));
-        if let Some(parent) = proof_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        full_prover(circuit, k, &public_input, proof_path.to_str().unwrap())
+        let _ = super::run(18);
     }
 }

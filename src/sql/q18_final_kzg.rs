@@ -955,42 +955,15 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// External benchmark entry point for Q18.
+pub fn run(k: u32) -> crate::circuits::utils::BenchResult {
     use crate::circuits::utils::full_prover;
-
-    use super::MyCircuit;
-    // use rand::Rng;
-    // use halo2_proofs::poly::commitment::Params
     use crate::data::data_processing;
     use chrono::{DateTime, NaiveDate, Utc};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::halo2curves::bn256::Fr as Fp;
     use std::marker::PhantomData;
-
-    use halo2_proofs::{
-        halo2curves::bn256::{Bn256, Fr as Fp, G1Affine},
-        plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
-        poly::{
-            commitment::ParamsProver,
-            kzg::{
-                commitment::{KZGCommitmentScheme, ParamsKZG},
-                multiopen::{ProverSHPLONK, VerifierSHPLONK},
-                strategy::SingleStrategy,
-            },
-        },
-        transcript::{
-            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
-        },
-    };
-    use rand::rngs::OsRng;
-    use std::process;
     use std::time::Instant;
-    use std::{fs::File, io::Write, path::Path};
-
-    #[test]
-    fn test_1() {
-        let k = 17;
-
+    {
         fn string_to_u64(s: &str) -> u64 {
             let mut result = 0;
 
@@ -1124,17 +1097,6 @@ mod tests {
 
         let public_input = vec![Fp::from(1)];
 
-        // // let test = true;
-        // let test = false;
-
-        // if test {
-        //     let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
-        //     prover.assert_satisfied();
-        // } else {
-        //     let proof_path = "/home/cc/halo2-TPCH/src/sql/proof_q18";
-        //     generate_and_verify_proof(k, circuit, &public_input, proof_path);
-        // }
-
         let proof_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("sql")
@@ -1143,5 +1105,13 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         full_prover(circuit, k, &public_input, proof_path.to_str().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_1() {
+        let _ = super::run(18);
     }
 }

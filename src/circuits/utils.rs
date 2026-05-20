@@ -14,10 +14,33 @@ use halo2_proofs::{
     },
 };
 use rand::rngs::OsRng;
+use serde::Serialize;
 use std::time::Instant;
 use std::{fs::File, io::Write, path::Path};
 
-pub fn full_prover<C: Circuit<Fp>>(circuit: C, k: u32, public_input: &[Fp], proof_path: &str) {
+/// Timings (seconds) and proof size (bytes) from a single full_prover run.
+///
+/// Returned by [`full_prover`] so callers — both unit tests and external
+/// benchmark harnesses — can record numbers without parsing stdout. `prove`,
+/// `verify`, and `proof_size` are the headline metrics; keygen times are
+/// included for completeness but typically excluded from prover/verifier
+/// totals because they correspond to one-time setup work.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchResult {
+    pub k: u32,
+    pub vk_time_s: f64,
+    pub pk_time_s: f64,
+    pub prove_time_s: f64,
+    pub verify_time_s: f64,
+    pub proof_size_bytes: usize,
+}
+
+pub fn full_prover<C: Circuit<Fp>>(
+    circuit: C,
+    k: u32,
+    public_input: &[Fp],
+    proof_path: &str,
+) -> BenchResult {
     let params_time_start = Instant::now();
     let params_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
@@ -62,7 +85,8 @@ pub fn full_prover<C: Circuit<Fp>>(circuit: C, k: u32, public_input: &[Fp], proo
     )
     .expect("prover should not fail");
     let proof = transcript.finalize();
-    println!("prove_time: {:?}", proof_time_start.elapsed());
+    let prove_time = proof_time_start.elapsed();
+    println!("prove_time: {:?}", prove_time);
     println!("proof_size_bytes: {}", proof.len());
 
     File::create(Path::new(proof_path))
@@ -89,5 +113,15 @@ pub fn full_prover<C: Circuit<Fp>>(circuit: C, k: u32, public_input: &[Fp], proo
         &mut transcript
     )
     .is_ok());
-    println!("verify_time: {:?}", verify_time_start.elapsed());
+    let verify_time = verify_time_start.elapsed();
+    println!("verify_time: {:?}", verify_time);
+
+    BenchResult {
+        k,
+        vk_time_s: vk_time.as_secs_f64(),
+        pk_time_s: pk_time.as_secs_f64(),
+        prove_time_s: prove_time.as_secs_f64(),
+        verify_time_s: verify_time.as_secs_f64(),
+        proof_size_bytes: proof.len(),
+    }
 }
