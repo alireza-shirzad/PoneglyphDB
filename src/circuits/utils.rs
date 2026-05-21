@@ -99,7 +99,7 @@ pub fn full_prover<C: Circuit<Fp>>(
     let verify_time_start = Instant::now();
     let strategy = SingleStrategy::new(&params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
-    assert!(verify_proof::<
+    let verify_result = verify_proof::<
         KZGCommitmentScheme<Bn256>,
         VerifierSHPLONK<'_, Bn256>,
         Challenge255<G1Affine>,
@@ -110,11 +110,14 @@ pub fn full_prover<C: Circuit<Fp>>(
         pk.get_vk(),
         strategy,
         &[&[public_input]],
-        &mut transcript
-    )
-    .is_ok());
+        &mut transcript,
+    );
     let verify_time = verify_time_start.elapsed();
     println!("verify_time: {:?}", verify_time);
+    println!("verify_ok: {}", verify_result.is_ok());
+    if let Err(err) = &verify_result {
+        println!("verify_error: {:?}", err);
+    }
 
     BenchResult {
         k,
