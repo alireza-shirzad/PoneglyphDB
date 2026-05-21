@@ -1524,14 +1524,14 @@ pub fn run(k: u32) -> crate::circuits::utils::BenchResult {
             .join("src")
             .join("data")
             .join("orders.tbl");
-        // Per the PoneglyphDB README, Q3's circuit is one-k tighter than the
-        // other queries for the same dataset size, so k=15/16/17 here maps to
-        // 60K/120K/240K rows. The previous mapping (16→60K, …) was off-by-one
-        // relative to the README and caused q3 at k=15 to panic.
+        // NOTE: The README claims Q3 fits at k=15/16/17 (one tighter than the
+        // other queries), but the actual circuit refuses to fit at k=15 with
+        // `NotEnoughRowsAvailable { current_k: 15 }`. Mapping is therefore the
+        // same as Q1/Q5/Q8/Q9/Q18: k=16/17/18 → 60K/120K/240K rows.
         let lineitem_filename = match k {
-            15 => "lineitem.tbl",
-            16 => "lineitem_120K.tbl",
-            17 => "lineitem_240K.tbl",
+            16 => "lineitem.tbl",
+            17 => "lineitem_120K.tbl",
+            18 => "lineitem_240K.tbl",
             _ => panic!("no lineitem file mapping for k={k}"),
         };
         let lineitem_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1653,6 +1653,6 @@ pub fn run(k: u32) -> crate::circuits::utils::BenchResult {
 mod tests {
     #[test]
     fn test_1() {
-        let _ = super::run(17);
+        let _ = super::run(18);
     }
 }
