@@ -14,15 +14,18 @@
 //!   rows' distinct keys are disjoint with a strictly increasing merge (Q3).
 //!
 //! As in the TPC-H circuits, the witness decides which rows the selectors of
-//! kept, output and group-end rows enable, and the query's result is the
-//! public input. Every value of the micro tables is below 2^24.
+//! kept, output and group-end rows enable, so the verifying key depends on the
+//! data, and the query's result is the public input. Nothing ties those
+//! selectors to the predicate: a prover who generates the keys can leave a
+//! passing row out of the result. The `Fixed` variants below remove this.
+//! Every value of the micro tables is below 2^24.
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::lessthan_or_equal_generic::{
     LtEqGenericChip, LtEqGenericConfig, LtEqGenericInstruction,
 };
 use crate::chips::permutation_any::PermAnyChip;
-use crate::circuits::utils::{full_prover, BenchResult};
+use crate::circuits::utils::{full_prover_columns, BenchResult};
 use halo2_proofs::halo2curves::bn256::Fr as Fp;
 use halo2_proofs::{circuit::*, halo2curves::ff::PrimeField, plonk::*, poly::Rotation};
 use std::collections::{BTreeSet, HashMap};
@@ -1049,6 +1052,724 @@ impl<F: Field> Circuit<F> for JoinCircuit<F> {
 }
 
 // ---------------------------------------------------------------------------
+// Data-independent variants. Every selector covers a range fixed by the table
+// size, so the verifying key depends only on the query and the size. Which
+// rows a filter keeps, where a group ends and which rows of a table join are
+// 0/1 witness flags instead. The output is a prefix of a fixed-size region,
+// marked by a flag that can only fall from 1 to 0, and each public output
+// column equals an instance column row by row. The shuffles carry the flags,
+// so the output holds exactly the flagged rows: none can be left out.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct OutputConfig {
+    q: Selector,
+    q_next: Selector,
+    flag: Column<Advice>,
+    columns: Vec<Column<Advice>>,
+    instances: Vec<Column<Instance>>,
+}
+
+impl OutputConfig {
+    /// `width` output columns, the first `public` of them equal to instance
+    /// columns.
+    fn configure<F: Field>(meta: &mut ConstraintSystem<F>, width: usize, public: usize) -> Self {
+        let q = meta.complex_selector();
+        let q_next = meta.selector();
+        let flag = meta.advice_column();
+        let columns: Vec<_> = (0..width).map(|_| meta.advice_column()).collect();
+        let instances: Vec<_> = (0..public).map(|_| meta.instance_column()).collect();
+        for (&c, &i) in columns.iter().zip(&instances) {
+            meta.enable_equality(c);
+            meta.enable_equality(i);
+        }
+        prefix_flag(meta, q, q_next, flag);
+        OutputConfig {
+            q,
+            q_next,
+            flag,
+            columns,
+            instances,
+        }
+    }
+
+    /// The flagged output tuple of the current row: (flag, flag * column...).
+    fn tuple<F: Field>(&self, m: &mut VirtualCells<'_, F>) -> Vec<Expression<F>> {
+        let gated = m.query_selector(self.q) * cur(m, self.flag);
+        std::iter::once(gated.clone())
+            .chain(self.columns.iter().map(|&c| gated.clone() * cur(m, c)))
+            .collect()
+    }
+
+    /// Assigns `rows` to the first rows of a region of `capacity` rows, and
+    /// returns the public columns' cells, every row of the region.
+    fn assign<F: Field>(
+        &self,
+        region: &mut Region<'_, F>,
+        capacity: usize,
+        rows: &[Vec<u64>],
+    ) -> Result<Vec<Vec<AssignedCell<F, F>>>, Error> {
+        assert!(
+            rows.len() <= capacity,
+            "the result exceeds the output region"
+        );
+        let mut cells = vec![Vec::new(); self.instances.len()];
+        for row in 0..capacity {
+            self.q.enable(region, row)?;
+            if row > 0 {
+                self.q_next.enable(region, row)?;
+            }
+            let values = rows.get(row);
+            assign(region, self.flag, row, values.is_some() as u64)?;
+            for (c, &column) in self.columns.iter().enumerate() {
+                let cell = assign(region, column, row, values.map_or(0, |v| v[c]))?;
+                if c < cells.len() {
+                    cells[c].push(cell);
+                }
+            }
+        }
+        Ok(cells)
+    }
+
+    /// Every row of each public column equals the same row of its instance
+    /// column; rows past the result equal the verifier's zero padding.
+    fn publish<F: Field>(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        cells: &[Vec<AssignedCell<F, F>>],
+    ) -> Result<(), Error> {
+        for (column, &instance) in cells.iter().zip(&self.instances) {
+            publish(layouter, instance, column)?;
+        }
+        Ok(())
+    }
+}
+
+/// `flag` is boolean on `q` rows and, on `q_next` rows (all but the first),
+/// set only where the previous row's is.
+fn prefix_flag<F: Field>(
+    meta: &mut ConstraintSystem<F>,
+    q: Selector,
+    q_next: Selector,
+    flag: Column<Advice>,
+) {
+    meta.create_gate("flag is boolean", |m| {
+        let f = cur(m, flag);
+        vec![m.query_selector(q) * f.clone() * (one() - f)]
+    });
+    meta.create_gate("flag is a prefix", |m| {
+        vec![m.query_selector(q_next) * cur(m, flag) * (one() - prev(m, flag))]
+    });
+}
+
+/// Shuffles `input` (a tuple per row) into `output`'s tuple.
+fn flagged_shuffle<F: Field>(
+    meta: &mut ConstraintSystem<F>,
+    name: &'static str,
+    input: impl Fn(&mut VirtualCells<'_, F>) -> Vec<Expression<F>> + 'static,
+    output: OutputConfig,
+) {
+    meta.shuffle(name, move |m| {
+        let input = input(m);
+        let output = output.tuple(m);
+        input.into_iter().zip(output).collect()
+    });
+}
+
+/// Columns of `rows`, as public inputs.
+fn columns_of(rows: &[Vec<u64>], width: usize) -> Vec<Vec<u64>> {
+    (0..width)
+        .map(|c| rows.iter().map(|r| r[c]).collect())
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectFixedConfig<F: Field> {
+    q_enable: Selector,
+    table: Vec<Column<Advice>>,
+    check: Column<Advice>,
+    eq: Vec<IsZeroConfig<F>>,
+    lt: Vec<LtEqGenericConfig<F, N_BYTES>>,
+    output: OutputConfig,
+}
+
+/// [`SelectCircuit`] with data-independent selectors: `check` gates the shuffle
+/// of every row into an output region of as many rows as the table.
+#[derive(Clone, Default)]
+pub struct SelectFixedCircuit<F, const PRED: u8, const W: usize> {
+    pub rows: Vec<Vec<u64>>,
+    _f: PhantomData<F>,
+}
+
+impl<F: Field, const PRED: u8, const W: usize> SelectFixedCircuit<F, PRED, W> {
+    pub fn new(rows: Vec<Vec<u64>>) -> Self {
+        Self {
+            rows,
+            _f: PhantomData,
+        }
+    }
+
+    pub fn result(&self) -> Vec<Vec<u64>> {
+        SelectCircuit::<F, PRED, W>::new(self.rows.clone()).result()
+    }
+}
+
+impl<F: Field, const PRED: u8, const W: usize> Circuit<F> for SelectFixedCircuit<F, PRED, W> {
+    type Config = SelectFixedConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::new(vec![])
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let q_enable = meta.complex_selector();
+        let table: Vec<_> = (0..W).map(|_| meta.advice_column()).collect();
+        let check = meta.advice_column();
+        let a = table[0];
+        let mut eq = Vec::new();
+        let mut lt = Vec::new();
+        match predicate(PRED) {
+            Predicate::EqAnd => {
+                eq.push(equality(meta, q_enable, table[0], FILTER.0));
+                eq.push(equality(meta, q_enable, table[1], FILTER.1));
+            }
+            Predicate::InList => {
+                for v in IN_VALUES {
+                    eq.push(equality(meta, q_enable, a, v));
+                }
+            }
+            Predicate::Range => {
+                lt.push(LtEqGenericChip::configure(
+                    meta,
+                    |m| m.query_selector(q_enable),
+                    |_| vec![constant(RANGE.0)],
+                    |m| vec![cur(m, a)],
+                ));
+                lt.push(LtEqGenericChip::configure(
+                    meta,
+                    |m| m.query_selector(q_enable),
+                    |m| vec![cur(m, a)],
+                    |_| vec![constant(RANGE.1)],
+                ));
+            }
+        }
+        let eq_exprs: Vec<_> = eq.iter().map(|c| c.expr()).collect();
+        let lts = lt.clone();
+        meta.create_gate("check is the predicate", |m| {
+            let keep = match predicate(PRED) {
+                Predicate::EqAnd => eq_exprs[0].clone() * eq_exprs[1].clone(),
+                Predicate::InList => eq_exprs
+                    .iter()
+                    .fold(Expression::Constant(F::ZERO), |acc, e| acc + e.clone()),
+                Predicate::Range => lts[0].is_lt(m, None) * lts[1].is_lt(m, None),
+            };
+            vec![m.query_selector(q_enable) * (keep - cur(m, check))]
+        });
+        let output = OutputConfig::configure(meta, W, W);
+        let cols = table.clone();
+        flagged_shuffle(
+            meta,
+            "kept rows are the output",
+            move |m| {
+                let gated = m.query_selector(q_enable) * cur(m, check);
+                std::iter::once(gated.clone())
+                    .chain(cols.iter().map(|&c| gated.clone() * cur(m, c)))
+                    .collect()
+            },
+            output.clone(),
+        );
+        SelectFixedConfig {
+            q_enable,
+            table,
+            check,
+            eq,
+            lt,
+            output,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let lt_chips = comparisons(&config.lt, &mut layouter)?;
+        let eq_chips: Vec<_> = config
+            .eq
+            .iter()
+            .map(|c| IsZeroChip::construct(c.clone()))
+            .collect();
+        let p = predicate(PRED);
+        let result = self.result();
+        let cells = layouter.assign_region(
+            || "select",
+            |mut region| {
+                for (row, values) in self.rows.iter().enumerate() {
+                    config.q_enable.enable(&mut region, row)?;
+                    for (c, &v) in values.iter().enumerate() {
+                        assign(&mut region, config.table[c], row, v)?;
+                    }
+                    assign(&mut region, config.check, row, p.keeps(values) as u64)?;
+                    let a = F::from(values[0]);
+                    match p {
+                        Predicate::EqAnd => {
+                            eq_chips[0].assign(
+                                &mut region,
+                                row,
+                                Value::known(a - F::from(FILTER.0)),
+                            )?;
+                            eq_chips[1].assign(
+                                &mut region,
+                                row,
+                                Value::known(F::from(values[1]) - F::from(FILTER.1)),
+                            )?;
+                        }
+                        Predicate::InList => {
+                            for (chip, v) in eq_chips.iter().zip(IN_VALUES) {
+                                chip.assign(&mut region, row, Value::known(a - F::from(v)))?;
+                            }
+                        }
+                        Predicate::Range => {
+                            lt_chips[0].assign(&mut region, row, &[F::from(RANGE.0)], &[a])?;
+                            lt_chips[1].assign(&mut region, row, &[a], &[F::from(RANGE.1)])?;
+                        }
+                    }
+                }
+                config.output.assign(&mut region, self.rows.len(), &result)
+            },
+        )?;
+        config.output.publish(&mut layouter, &cells)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupByFixedConfig<F: Field> {
+    q_sorted: Selector,
+    q_first: Selector,
+    q_adjacent: Selector,
+    q_last: Selector,
+    q_not_last: Selector,
+    table: Vec<Column<Advice>>,
+    sorted: Vec<Column<Advice>>,
+    same: Column<Advice>,
+    end: Column<Advice>,
+    sum: Column<Advice>,
+    count: Column<Advice>,
+    eq: IsZeroConfig<F>,
+    lt: LtEqGenericConfig<F, N_BYTES>,
+    output: OutputConfig,
+}
+
+/// [`GroupByCircuit`] with data-independent selectors: `end` is set where the
+/// next row starts another group, and gates the shuffle of (b, sum, count)
+/// into the output.
+#[derive(Clone, Default)]
+pub struct GroupByFixedCircuit<F> {
+    pub rows: Vec<Vec<u64>>,
+    _f: PhantomData<F>,
+}
+
+impl<F: Field> GroupByFixedCircuit<F> {
+    pub fn new(rows: Vec<Vec<u64>>) -> Self {
+        Self {
+            rows,
+            _f: PhantomData,
+        }
+    }
+
+    pub fn result(&self) -> Vec<Vec<u64>> {
+        GroupByCircuit::<F>::new(self.rows.clone())
+            .result()
+            .chunks(3)
+            .map(|g| g.to_vec())
+            .collect()
+    }
+}
+
+impl<F: Field> Circuit<F> for GroupByFixedCircuit<F> {
+    type Config = GroupByFixedConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::new(vec![])
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let q_sorted = meta.complex_selector();
+        let q_first = meta.selector();
+        let q_adjacent = meta.selector();
+        let q_last = meta.selector();
+        let q_not_last = meta.selector();
+        let table: Vec<_> = (0..2).map(|_| meta.advice_column()).collect();
+        let sorted: Vec<_> = (0..2).map(|_| meta.advice_column()).collect();
+        let (same, end) = (meta.advice_column(), meta.advice_column());
+        let (sum, count) = (meta.advice_column(), meta.advice_column());
+        let (a, b) = (sorted[0], sorted[1]);
+
+        let (t, s) = (table.clone(), sorted.clone());
+        meta.shuffle("sorted rows are the input rows", move |m| {
+            let q = m.query_selector(q_sorted);
+            t.iter()
+                .zip(&s)
+                .map(|(&t, &s)| (q.clone() * cur(m, t), q.clone() * cur(m, s)))
+                .collect()
+        });
+        let lt = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(q_adjacent),
+            |m| vec![prev(m, b)],
+            |m| vec![cur(m, b)],
+        );
+        let inv = meta.advice_column();
+        let eq = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_adjacent),
+            |m| prev(m, b) - cur(m, b),
+            inv,
+        );
+        let same_expr = eq.expr();
+        meta.create_gate("sorted by b", |m| {
+            vec![m.query_selector(q_adjacent) * (lt.is_lt(m, None) - one())]
+        });
+        meta.create_gate("same group as the previous row", |m| {
+            vec![m.query_selector(q_adjacent) * (cur(m, same) - same_expr.clone())]
+        });
+        meta.create_gate("first row", |m| {
+            let q = m.query_selector(q_first);
+            vec![
+                q.clone() * cur(m, same),
+                q.clone() * (cur(m, sum) - cur(m, a)),
+                q * (cur(m, count) - one()),
+            ]
+        });
+        meta.create_gate("running sums per group", |m| {
+            let q = m.query_selector(q_adjacent);
+            let s = cur(m, same);
+            vec![
+                q.clone() * (cur(m, sum) - s.clone() * prev(m, sum) - cur(m, a)),
+                q * (cur(m, count) - s * prev(m, count) - one()),
+            ]
+        });
+        meta.create_gate("a group ends where the next starts", |m| {
+            vec![m.query_selector(q_not_last) * (cur(m, end) - (one() - next(m, same)))]
+        });
+        meta.create_gate("the last row ends a group", |m| {
+            vec![m.query_selector(q_last) * (cur(m, end) - one())]
+        });
+        let output = OutputConfig::configure(meta, 3, 3);
+        flagged_shuffle(
+            meta,
+            "group ends are the output",
+            move |m| {
+                let gated = m.query_selector(q_sorted) * cur(m, end);
+                vec![
+                    gated.clone(),
+                    gated.clone() * cur(m, b),
+                    gated.clone() * cur(m, sum),
+                    gated * cur(m, count),
+                ]
+            },
+            output.clone(),
+        );
+
+        GroupByFixedConfig {
+            q_sorted,
+            q_first,
+            q_adjacent,
+            q_last,
+            q_not_last,
+            table,
+            sorted,
+            same,
+            end,
+            sum,
+            count,
+            eq,
+            lt,
+            output,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let lt = &comparisons(&[config.lt], &mut layouter)?[0];
+        let eq = IsZeroChip::construct(config.eq.clone());
+        let mut sorted = self.rows.clone();
+        sorted.sort_by_key(|r| r[1]);
+        let result = self.result();
+        let n = sorted.len();
+        let cells = layouter.assign_region(
+            || "group by",
+            |mut region| {
+                for (row, values) in self.rows.iter().enumerate() {
+                    for c in 0..2 {
+                        assign(&mut region, config.table[c], row, values[c])?;
+                    }
+                }
+                config.q_first.enable(&mut region, 0)?;
+                config.q_last.enable(&mut region, n - 1)?;
+                let (mut sum, mut count) = (0u64, 0u64);
+                for (row, values) in sorted.iter().enumerate() {
+                    config.q_sorted.enable(&mut region, row)?;
+                    if row + 1 < n {
+                        config.q_not_last.enable(&mut region, row)?;
+                    }
+                    assign(&mut region, config.sorted[0], row, values[0])?;
+                    assign(&mut region, config.sorted[1], row, values[1])?;
+                    let same = row > 0 && sorted[row - 1][1] == values[1];
+                    if row > 0 {
+                        config.q_adjacent.enable(&mut region, row)?;
+                        let (p, c) = (F::from(sorted[row - 1][1]), F::from(values[1]));
+                        lt.assign(&mut region, row, &[p], &[c])?;
+                        eq.assign(&mut region, row, Value::known(p - c))?;
+                    }
+                    (sum, count) = if same {
+                        (sum + values[0], count + 1)
+                    } else {
+                        (values[0], 1)
+                    };
+                    let ends = sorted.get(row + 1).map_or(true, |n| n[1] != values[1]);
+                    assign(&mut region, config.same, row, same as u64)?;
+                    assign(&mut region, config.end, row, ends as u64)?;
+                    assign(&mut region, config.sum, row, sum)?;
+                    assign(&mut region, config.count, row, count)?;
+                }
+                config.output.assign(&mut region, n, &result)
+            },
+        )?;
+        config.output.publish(&mut layouter, &cells)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct JoinFixedConfig<F: Field> {
+    q_in: Selector,
+    q_dedup: Selector,
+    q_dedup_next: Selector,
+    input: [Column<Advice>; 2],
+    split: [Column<Advice>; 2],
+    joins: [Column<Advice>; 2],
+    others: [Column<Advice>; 2],
+    dedup: Column<Advice>,
+    dedup_of: [Column<Advice>; 2],
+    dedup_any: Column<Advice>,
+    merged: Column<Advice>,
+    merged_flag: Column<Advice>,
+    lt: LtEqGenericConfig<F, N_BYTES>,
+    output: OutputConfig,
+}
+
+/// [`JoinCircuit`] with data-independent selectors. `joins[t]` flags the rows
+/// of `split[t]` that join; the output region has 3/2 as many rows as a
+/// table, and the distinct other keys (`dedup`, `dedup_of[t]` saying whose)
+/// and their sorted merge share a region of the same size.
+#[derive(Clone, Default)]
+pub struct JoinFixedCircuit<F> {
+    pub tables: [Vec<u64>; 2],
+    _f: PhantomData<F>,
+}
+
+impl<F: Field> JoinFixedCircuit<F> {
+    pub fn new(l: Vec<u64>, r: Vec<u64>) -> Self {
+        Self {
+            tables: [l, r],
+            _f: PhantomData,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        let n = self.tables[0].len().max(self.tables[1].len());
+        n + n / 2
+    }
+
+    pub fn result(&self) -> Vec<u64> {
+        JoinCircuit::<F>::new(self.tables[0].clone(), self.tables[1].clone()).result()
+    }
+}
+
+impl<F: Field> Circuit<F> for JoinFixedCircuit<F> {
+    type Config = JoinFixedConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::new(vec![], vec![])
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let q_in = meta.complex_selector();
+        let q_dedup = meta.complex_selector();
+        let q_dedup_next = meta.selector();
+        let columns = |meta: &mut ConstraintSystem<F>| [meta.advice_column(), meta.advice_column()];
+        let (input, split, joins, dedup_of) =
+            (columns(meta), columns(meta), columns(meta), columns(meta));
+        let others = columns(meta);
+        let (dedup, merged, merged_flag) = (
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        );
+        let dedup_any = meta.advice_column();
+        let output = OutputConfig::configure(meta, 2, 1);
+
+        // `others` and `dedup_any` keep constants and sums out of the lookups
+        // and shuffles, whose evaluator in this halo2 mishandles them.
+        meta.create_gate("join flags are boolean", move |m| {
+            let q = m.query_selector(q_in);
+            (0..2)
+                .flat_map(|t| {
+                    let j = cur(m, joins[t]);
+                    [
+                        q.clone() * j.clone() * (one() - j.clone()),
+                        q.clone() * (cur(m, others[t]) - (one() - j)),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        });
+        meta.create_gate("each distinct key is one table's", move |m| {
+            let q = m.query_selector(q_dedup);
+            let (d0, d1) = (cur(m, dedup_of[0]), cur(m, dedup_of[1]));
+            vec![
+                q.clone() * d0.clone() * (one() - d0.clone()),
+                q.clone() * d1.clone() * (one() - d1.clone()),
+                q.clone() * d0.clone() * d1.clone(),
+                q * (cur(m, dedup_any) - d0 - d1),
+            ]
+        });
+        for t in 0..2 {
+            meta.shuffle("split rows are the input rows", move |m| {
+                let q = m.query_selector(q_in);
+                vec![(q.clone() * cur(m, input[t]), q * cur(m, split[t]))]
+            });
+            let out = output.clone();
+            meta.lookup_any("output key among the joining rows", move |m| {
+                let gated = m.query_selector(out.q) * cur(m, out.flag);
+                let j = cur(m, joins[t]);
+                vec![
+                    (gated.clone(), j.clone()),
+                    (gated * cur(m, out.columns[t]), j * cur(m, split[t])),
+                ]
+            });
+            meta.lookup_any("other key among the distinct other keys", move |m| {
+                let other = m.query_selector(q_in) * cur(m, others[t]);
+                let d = cur(m, dedup_of[t]);
+                vec![
+                    (other.clone(), d.clone()),
+                    (other * cur(m, split[t]), d * cur(m, dedup)),
+                ]
+            });
+        }
+        let out = output.clone();
+        meta.create_gate("output keys equal", move |m| {
+            vec![m.query_selector(out.q) * (cur(m, out.columns[0]) - cur(m, out.columns[1]))]
+        });
+        prefix_flag(meta, q_dedup, q_dedup_next, merged_flag);
+        meta.shuffle("merged keys are the distinct other keys", move |m| {
+            let q = m.query_selector(q_dedup);
+            let d = q.clone() * cur(m, dedup_any);
+            let f = q * cur(m, merged_flag);
+            vec![
+                (d.clone(), f.clone()),
+                (d * cur(m, dedup), f * cur(m, merged)),
+            ]
+        });
+        let lt = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(q_dedup_next),
+            |m| vec![prev(m, merged), one()],
+            |m| vec![cur(m, merged)],
+        );
+        meta.create_gate("merged keys strictly increase", move |m| {
+            vec![m.query_selector(q_dedup_next) * cur(m, merged_flag) * (lt.is_lt(m, None) - one())]
+        });
+
+        JoinFixedConfig {
+            q_in,
+            q_dedup,
+            q_dedup_next,
+            input,
+            split,
+            joins,
+            others,
+            dedup,
+            dedup_of,
+            dedup_any,
+            merged,
+            merged_flag,
+            lt,
+            output,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let lt = &comparisons(&[config.lt], &mut layouter)?[0];
+        let w = JoinCircuit::<F>::new(self.tables[0].clone(), self.tables[1].clone()).witness();
+        let capacity = self.capacity();
+        let out: Vec<Vec<u64>> = w.out.iter().map(|&k| vec![k, k]).collect();
+        let dedup: Vec<(usize, u64)> = (0..2)
+            .flat_map(|t| w.dedup[t].iter().map(move |&k| (t, k)))
+            .collect();
+        assert!(
+            dedup.len() <= capacity,
+            "the distinct other keys exceed their region"
+        );
+        let mut merged: Vec<u64> = dedup.iter().map(|&(_, k)| k).collect();
+        merged.sort();
+        let cells = layouter.assign_region(
+            || "join",
+            |mut region| {
+                for t in 0..2 {
+                    let (join, other) = &w.split[t];
+                    for (row, &k) in self.tables[t].iter().enumerate() {
+                        config.q_in.enable(&mut region, row)?;
+                        assign(&mut region, config.input[t], row, k)?;
+                    }
+                    for (row, &k) in join.iter().chain(other).enumerate() {
+                        assign(&mut region, config.split[t], row, k)?;
+                        let joins = row < join.len();
+                        assign(&mut region, config.joins[t], row, joins as u64)?;
+                        assign(&mut region, config.others[t], row, !joins as u64)?;
+                    }
+                }
+                for row in 0..capacity {
+                    config.q_dedup.enable(&mut region, row)?;
+                    let d = dedup.get(row);
+                    assign(&mut region, config.dedup, row, d.map_or(0, |&(_, k)| k))?;
+                    for t in 0..2 {
+                        let of = d.is_some_and(|&(u, _)| u == t);
+                        assign(&mut region, config.dedup_of[t], row, of as u64)?;
+                    }
+                    assign(&mut region, config.dedup_any, row, d.is_some() as u64)?;
+                    let m = merged.get(row);
+                    assign(&mut region, config.merged, row, m.copied().unwrap_or(0))?;
+                    assign(&mut region, config.merged_flag, row, m.is_some() as u64)?;
+                    if row > 0 {
+                        config.q_dedup_next.enable(&mut region, row)?;
+                        let previous = merged.get(row - 1).copied().unwrap_or(0);
+                        let current = m.copied().unwrap_or(0);
+                        lt.assign(
+                            &mut region,
+                            row,
+                            &[F::from(previous), F::ONE],
+                            &[F::from(current)],
+                        )?;
+                    }
+                }
+                config.output.assign(&mut region, capacity, &out)
+            },
+        )?;
+        config.output.publish(&mut layouter, &cells)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point.
 // ---------------------------------------------------------------------------
 
@@ -1058,60 +1779,104 @@ pub struct MicroResult {
     pub public_inputs: usize,
 }
 
-/// Proves and verifies `query` (a name from `micro.rs`) over `tables`, each a
-/// list of rows, at Halo2 degree `k`.
-pub fn run(query: &str, k: u32, tables: &[Vec<Vec<u64>>], proof_path: &str) -> MicroResult {
-    fn go<C: Circuit<Fp>>(circuit: C, k: u32, public: Vec<u64>, proof_path: &str) -> MicroResult {
-        let public: Vec<Fp> = public.into_iter().map(Fp::from).collect();
-        MicroResult {
-            bench: full_prover(circuit, k, &public, proof_path),
-            public_inputs: public.len(),
-        }
+fn prove<C: Circuit<Fp>>(
+    circuit: C,
+    k: u32,
+    public: Vec<Vec<u64>>,
+    proof_path: &str,
+) -> MicroResult {
+    let public: Vec<Vec<Fp>> = public
+        .into_iter()
+        .map(|column| column.into_iter().map(Fp::from).collect())
+        .collect();
+    let columns: Vec<&[Fp]> = public.iter().map(Vec::as_slice).collect();
+    MicroResult {
+        bench: full_prover_columns(circuit, k, &columns, proof_path),
+        public_inputs: public.iter().map(Vec::len).sum(),
     }
+}
+
+/// Proves and verifies `query` (a name from `micro.rs`) over `tables`, each a
+/// list of rows, at Halo2 degree `k`. With `fixed`, selection, GROUP BY and
+/// joins use the data-independent circuits; SUM and ORDER BY have only one,
+/// whose selectors already depend only on the table size.
+pub fn run(
+    query: &str,
+    fixed: bool,
+    k: u32,
+    tables: &[Vec<Vec<u64>>],
+    proof_path: &str,
+) -> MicroResult {
     let rows = || tables[0].clone();
-    match query {
-        "filter_0p1" | "filter_1" | "filter_10" => {
+    match (query, fixed) {
+        ("filter_0p1" | "filter_1" | "filter_10", false) => {
             let c = SelectCircuit::<Fp, EQ_AND, 4>::new(rows());
-            let public = c.result().concat();
-            go(c, k, public, proof_path)
+            let public = vec![c.result().concat()];
+            prove(c, k, public, proof_path)
         }
-        "range" => {
+        ("filter_0p1" | "filter_1" | "filter_10", true) => {
+            let c = SelectFixedCircuit::<Fp, EQ_AND, 4>::new(rows());
+            let public = columns_of(&c.result(), 4);
+            prove(c, k, public, proof_path)
+        }
+        ("range", false) => {
             let c = SelectCircuit::<Fp, RANGE_PRED, 2>::new(rows());
-            let public = c.result().concat();
-            go(c, k, public, proof_path)
+            let public = vec![c.result().concat()];
+            prove(c, k, public, proof_path)
         }
-        "in_list" => {
+        ("range", true) => {
+            let c = SelectFixedCircuit::<Fp, RANGE_PRED, 2>::new(rows());
+            let public = columns_of(&c.result(), 2);
+            prove(c, k, public, proof_path)
+        }
+        ("in_list", false) => {
             let c = SelectCircuit::<Fp, IN_LIST, 4>::new(rows());
-            let public = c.result().concat();
-            go(c, k, public, proof_path)
+            let public = vec![c.result().concat()];
+            prove(c, k, public, proof_path)
         }
-        "aggregate" => {
+        ("in_list", true) => {
+            let c = SelectFixedCircuit::<Fp, IN_LIST, 4>::new(rows());
+            let public = columns_of(&c.result(), 4);
+            prove(c, k, public, proof_path)
+        }
+        ("aggregate", _) => {
             let c = SumCircuit::<Fp, false>::new(rows());
-            let public = c.result();
-            go(c, k, public, proof_path)
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
         }
-        "arithmetic" => {
+        ("arithmetic", _) => {
             let c = SumCircuit::<Fp, true>::new(rows());
-            let public = c.result();
-            go(c, k, public, proof_path)
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
         }
-        "group_by" => {
+        ("group_by", false) => {
             let c = GroupByCircuit::<Fp>::new(rows());
-            let public = c.result();
-            go(c, k, public, proof_path)
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
         }
-        "order_by" => {
+        ("group_by", true) => {
+            let c = GroupByFixedCircuit::<Fp>::new(rows());
+            let public = columns_of(&c.result(), 3);
+            prove(c, k, public, proof_path)
+        }
+        ("order_by", _) => {
             let c = OrderByCircuit::<Fp>::new(rows());
-            let public = c.result();
-            go(c, k, public, proof_path)
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
         }
-        "join_pk_fk" | "join_m2m" => {
+        ("join_pk_fk" | "join_m2m", false) => {
             let key = |t: &Vec<Vec<u64>>| t.iter().map(|r| r[0]).collect();
             let c = JoinCircuit::<Fp>::new(key(&tables[0]), key(&tables[1]));
-            let public = c.result();
-            go(c, k, public, proof_path)
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
         }
-        other => panic!("unknown micro query {other}"),
+        ("join_pk_fk" | "join_m2m", true) => {
+            let key = |t: &Vec<Vec<u64>>| t.iter().map(|r| r[0]).collect();
+            let c = JoinFixedCircuit::<Fp>::new(key(&tables[0]), key(&tables[1]));
+            let public = vec![c.result()];
+            prove(c, k, public, proof_path)
+        }
+        (other, _) => panic!("unknown micro query {other}"),
     }
 }
 
@@ -1139,18 +1904,40 @@ mod tests {
     }
 
     fn check<C: Circuit<Fp>>(circuit: C, public: Vec<u64>) {
-        let public: Vec<Fp> = public.into_iter().map(Fp::from).collect();
-        let prover = MockProver::run(10, &circuit, vec![public.clone()]).unwrap();
-        prover.assert_satisfied();
-        // A wrong result must not verify.
+        check_columns(circuit, vec![public]);
+    }
+
+    fn mock(circuit: &impl Circuit<Fp>, public: &[Vec<u64>]) -> bool {
+        let public: Vec<Vec<Fp>> = public
+            .iter()
+            .map(|c| c.iter().map(|&v| Fp::from(v)).collect())
+            .collect();
+        MockProver::run(11, circuit, public)
+            .unwrap()
+            .verify()
+            .is_ok()
+    }
+
+    /// The circuit accepts its result and rejects it with one value changed.
+    fn check_columns<C: Circuit<Fp>>(circuit: C, public: Vec<Vec<u64>>) {
+        assert!(mock(&circuit, &public), "the result does not verify");
         let mut wrong = public;
-        if let Some(v) = wrong.first_mut() {
-            *v += Fp::from(1);
-        } else {
-            wrong.push(Fp::from(1));
+        match wrong[0].first_mut() {
+            Some(v) => *v += 1,
+            None => wrong[0].push(1),
         }
-        let prover = MockProver::run(10, &circuit, vec![wrong]).unwrap();
-        assert!(prover.verify().is_err());
+        assert!(!mock(&circuit, &wrong), "a wrong result verifies");
+    }
+
+    /// A data-independent circuit also rejects its result with the last row
+    /// left out.
+    fn check_fixed<C: Circuit<Fp>>(circuit: C, public: Vec<Vec<u64>>) {
+        let mut short = public.clone();
+        for column in &mut short {
+            column.pop();
+        }
+        assert!(!mock(&circuit, &short), "a result missing a row verifies");
+        check_columns(circuit, public);
     }
 
     #[test]
@@ -1225,11 +2012,38 @@ mod tests {
             ("order_by", table(&[100000, 1000], 17)),
             ("join_m2m", vec![keys(18), keys(19)]),
         ] {
-            assert!(
-                run(q, 10, &tables, &path(q)).bench.verified,
-                "{q} did not verify"
-            );
+            for fixed in [false, true] {
+                assert!(
+                    run(q, fixed, 10, &tables, &path(q)).bench.verified,
+                    "{q} (fixed: {fixed}) did not verify"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn fixed_selectors() {
+        let mut t = rows(200, &[4, 4, 1000, 1000], 1);
+        t[3] = vec![1, 2, 7, 8];
+        let c = SelectFixedCircuit::<Fp, EQ_AND, 4>::new(t);
+        let public = columns_of(&c.result(), 4);
+        check_fixed(c, public);
+        let c = SelectFixedCircuit::<Fp, RANGE_PRED, 2>::new(rows(200, &[1000, 1000], 2));
+        let public = columns_of(&c.result(), 2);
+        check_fixed(c, public);
+        let c = GroupByFixedCircuit::<Fp>::new(rows(200, &[1000, 7], 6));
+        let public = columns_of(&c.result(), 3);
+        check_fixed(c, public);
+        let l: Vec<u64> = (0..100).collect();
+        let r: Vec<u64> = rows(100, &[150], 8).into_iter().map(|r| r[0]).collect();
+        let c = JoinFixedCircuit::<Fp>::new(l, r);
+        let public = vec![c.result()];
+        check_fixed(c, public);
+        let l: Vec<u64> = rows(100, &[100], 9).into_iter().map(|r| r[0]).collect();
+        let r: Vec<u64> = rows(100, &[100], 10).into_iter().map(|r| r[0]).collect();
+        let c = JoinFixedCircuit::<Fp>::new(l, r);
+        let public = vec![c.result()];
+        check_fixed(c, public);
     }
 
     #[test]

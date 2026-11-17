@@ -42,6 +42,17 @@ pub fn full_prover<C: Circuit<Fp>>(
     public_input: &[Fp],
     proof_path: &str,
 ) -> BenchResult {
+    full_prover_columns(circuit, k, &[public_input], proof_path)
+}
+
+/// [`full_prover`] for a circuit with one instance column per entry of
+/// `public_inputs`.
+pub fn full_prover_columns<C: Circuit<Fp>>(
+    circuit: C,
+    k: u32,
+    public_inputs: &[&[Fp]],
+    proof_path: &str,
+) -> BenchResult {
     let params_time_start = Instant::now();
     let params_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
@@ -80,7 +91,7 @@ pub fn full_prover<C: Circuit<Fp>>(
         &params,
         &pk,
         &[circuit],
-        &[&[public_input]],
+        &[public_inputs],
         OsRng,
         &mut transcript,
     )
@@ -110,7 +121,7 @@ pub fn full_prover<C: Circuit<Fp>>(
         verifier_params,
         pk.get_vk(),
         strategy,
-        &[&[public_input]],
+        &[public_inputs],
         &mut transcript,
     );
     let verify_time = verify_time_start.elapsed();
