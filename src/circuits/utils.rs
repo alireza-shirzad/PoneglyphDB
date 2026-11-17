@@ -77,15 +77,49 @@ pub fn full_prover<C: Circuit<Fp>>(
     public_input: &[Fp],
     proof_path: &str,
 ) -> BenchResult {
-    full_prover_columns(circuit, k, &[public_input], proof_path)
+    full_prover_columns(circuit, k, &[public_input], &[], proof_path)
+}
+
+/// The data owner's commitments to table columns for a degree-`k` circuit:
+/// each column zero-padded to the domain and committed with no blinding
+/// factor, as the prover commits an unblinded advice column. Returns them and
+/// the time spent committing (not loading the parameters).
+pub fn commit_columns(k: u32, columns: &[Vec<Fp>]) -> (Vec<G1Affine>, std::time::Duration) {
+    use halo2_proofs::halo2curves::group::Curve;
+    use halo2_proofs::poly::{commitment::Blind, EvaluationDomain};
+    let params = ParamsKZG::<Bn256>::read(&mut File::open(params_path(k)).unwrap()).unwrap();
+    let domain = EvaluationDomain::<Fp>::new(1, k);
+    let start = Instant::now();
+    let commitments = columns
+        .iter()
+        .map(|column| {
+            let mut values = column.clone();
+            values.resize(params.n() as usize, Fp::zero());
+            params
+                .commit_lagrange(&domain.lagrange_from_vec(values), Blind::default())
+                .to_affine()
+        })
+        .collect();
+    (commitments, start.elapsed())
+}
+
+/// Whether `proof` commits the advice columns of `bound` to the given
+/// commitments. The proof opens with the advice commitments, in column order.
+fn binds(proof: &[u8], num_advice: usize, bound: &[(usize, G1Affine)]) -> bool {
+    use halo2_proofs::transcript::TranscriptRead;
+    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof);
+    let advice: Result<Vec<G1Affine>, _> = (0..num_advice).map(|_| transcript.read_point()).collect();
+    advice.is_ok_and(|advice| bound.iter().all(|&(i, c)| advice.get(i) == Some(&c)))
 }
 
 /// [`full_prover`] for a circuit with one instance column per entry of
-/// `public_inputs`.
+/// `public_inputs`. The verifier also checks that the proof's advice columns
+/// of `bound` (column index, commitment) carry the data owner's commitments.
 pub fn full_prover_columns<C: Circuit<Fp>>(
     circuit: C,
     k: u32,
     public_inputs: &[&[Fp]],
+    bound: &[(usize, G1Affine)],
     proof_path: &str,
 ) -> BenchResult {
     let params_time_start = Instant::now();
@@ -164,7 +198,11 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
             &[public_inputs],
             &mut transcript,
         );
-        (result, start.elapsed())
+        let num_advice = pk.get_vk().cs().num_advice_columns();
+        let bound_ok = binds(&proof, num_advice, bound);
+        (result.map_err(|e| format!("{e:?}")).and_then(|()| {
+            bound_ok.then_some(()).ok_or_else(|| "the tables are not the committed ones".to_string())
+        }), start.elapsed())
     };
     // Verification repeats for up to a second; the median is reported.
     let (verify_result, first) = verify();

@@ -48,3 +48,9 @@ bincode = "1.3.3"
 
 
 
+
+# Unblinded advice columns (privacy-scaling-explorations/halo2#220), which bind
+# the micro and fixed TPC-H circuits to the data owner's table commitments.
+[patch."https://github.com/tuzijun111/halo2_PSE"]
+halo2_proofs = { git = "https://github.com/alireza-shirzad/halo2_PSE", rev = "e3642ecfa86f8a979a348ed57b122778450365b6" }
+halo2_gadgets = { git = "https://github.com/alireza-shirzad/halo2_PSE", rev = "e3642ecfa86f8a979a348ed57b122778450365b6" }
