@@ -34,6 +34,41 @@ pub struct BenchResult {
     pub verify_time_s: f64,
     pub proof_size_bytes: usize,
     pub verified: bool,
+    pub params_bytes: u64,
+    pub vk_bytes: u64,
+    pub pk_bytes: u64,
+}
+
+/// Counts the bytes written to it.
+struct ByteCounter(u64);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn params_path(k: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("sql")
+        .join(format!("kzg_param{k}"))
+}
+
+/// Generates the KZG parameters for degree `k`, replacing any cached ones, and
+/// returns the time it took.
+pub fn setup_params(k: u32) -> std::time::Duration {
+    let start = Instant::now();
+    let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+    let elapsed = start.elapsed();
+    let mut fd = std::fs::File::create(params_path(k)).unwrap();
+    params.write(&mut fd).unwrap();
+    elapsed
 }
 
 pub fn full_prover<C: Circuit<Fp>>(
@@ -54,10 +89,7 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
     proof_path: &str,
 ) -> BenchResult {
     let params_time_start = Instant::now();
-    let params_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("sql")
-        .join(format!("kzg_param{k}"));
+    let params_path = params_path(k);
     if !params_path.exists() {
         let params = ParamsKZG::<Bn256>::setup(k, OsRng);
         let mut fd = std::fs::File::create(&params_path).unwrap();
@@ -77,6 +109,13 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
     let pk = keygen_pk(&params, vk, &circuit).unwrap();
     let pk_time = pk_time_start.elapsed();
     println!("Time to generate pk {:?}", pk_time);
+    let key_bytes = |write: &dyn Fn(&mut ByteCounter) -> std::io::Result<()>| {
+        let mut counter = ByteCounter(0);
+        write(&mut counter).unwrap();
+        counter.0
+    };
+    let vk_bytes = key_bytes(&|w| pk.get_vk().write(w, halo2_proofs::SerdeFormat::RawBytes));
+    let pk_bytes = key_bytes(&|w| pk.write(w, halo2_proofs::SerdeFormat::RawBytes));
 
     let proof_time_start = Instant::now();
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
@@ -108,23 +147,33 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
     println!("Proof written to: {}", proof_path);
 
     let verifier_params = params.verifier_params();
-    let verify_time_start = Instant::now();
-    let strategy = SingleStrategy::new(&params);
-    let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
-    let verify_result = verify_proof::<
-        KZGCommitmentScheme<Bn256>,
-        VerifierSHPLONK<'_, Bn256>,
-        Challenge255<G1Affine>,
-        Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
-        SingleStrategy<'_, Bn256>,
-    >(
-        verifier_params,
-        pk.get_vk(),
-        strategy,
-        &[public_inputs],
-        &mut transcript,
-    );
-    let verify_time = verify_time_start.elapsed();
+    let verify = || {
+        let strategy = SingleStrategy::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        let start = Instant::now();
+        let result = verify_proof::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<'_, Bn256>,
+            Challenge255<G1Affine>,
+            Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+            SingleStrategy<'_, Bn256>,
+        >(
+            verifier_params,
+            pk.get_vk(),
+            strategy,
+            &[public_inputs],
+            &mut transcript,
+        );
+        (result, start.elapsed())
+    };
+    // Verification repeats for up to a second; the median is reported.
+    let (verify_result, first) = verify();
+    let mut times = vec![first];
+    while times.iter().sum::<std::time::Duration>() < std::time::Duration::from_secs(1) {
+        times.push(verify().1);
+    }
+    times.sort();
+    let verify_time = times[times.len() / 2];
     println!("verify_time: {:?}", verify_time);
     println!("verify_ok: {}", verify_result.is_ok());
     if let Err(err) = &verify_result {
@@ -139,5 +188,8 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
         verify_time_s: verify_time.as_secs_f64(),
         proof_size_bytes: proof.len(),
         verified: verify_result.is_ok(),
+        params_bytes: std::fs::metadata(&params_path).map_or(0, |m| m.len()),
+        vk_bytes,
+        pk_bytes,
     }
 }
