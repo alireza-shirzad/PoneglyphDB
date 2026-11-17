@@ -42,5 +42,6 @@ pub mod q9_final_kzg;
 pub mod q9_final_v1;
 pub mod q9_final_v2;
 
+pub mod micro_kzg;
 pub mod test;
 pub mod test1;

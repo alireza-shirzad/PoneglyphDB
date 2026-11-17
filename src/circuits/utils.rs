@@ -33,6 +33,7 @@ pub struct BenchResult {
     pub prove_time_s: f64,
     pub verify_time_s: f64,
     pub proof_size_bytes: usize,
+    pub verified: bool,
 }
 
 pub fn full_prover<C: Circuit<Fp>>(
@@ -126,5 +127,6 @@ pub fn full_prover<C: Circuit<Fp>>(
         prove_time_s: prove_time.as_secs_f64(),
         verify_time_s: verify_time.as_secs_f64(),
         proof_size_bytes: proof.len(),
+        verified: verify_result.is_ok(),
     }
 }
