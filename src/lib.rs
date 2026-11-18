@@ -21,6 +21,7 @@ pub mod sql;
 /// Callers are responsible for picking the right `k` per query.
 pub mod poneglyph_bench {
     pub use crate::circuits::utils::{setup_params, BenchResult};
+    pub use halo2_proofs::halo2curves::bn256::Fr as Fp;
     pub use crate::sql::micro_kzg::{run as run_micro, supported as micro_supported, MicroResult};
     /// The data-independent TPC-H circuits, bound to the committed tables.
     pub use crate::sql::fixed_tpch as fixed;
