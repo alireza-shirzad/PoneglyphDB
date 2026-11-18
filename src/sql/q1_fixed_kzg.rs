@@ -421,4 +421,14 @@ mod tests {
         assert!(!mock(&circuit, &wrong));
         assert!(!mock(&circuit, &result[..2]));
     }
+
+    #[test]
+    fn prove_and_verify() {
+        let path = std::env::temp_dir().join("fixed_q1.proof");
+        assert!(
+            run(11, rows(300), &path.display().to_string())
+                .bench
+                .verified
+        );
+    }
 }

@@ -60,6 +60,14 @@ fn params_path(k: u32) -> std::path::PathBuf {
         .join(format!("kzg_param{k}"))
 }
 
+/// The cached KZG parameters for degree `k`, generated first if missing.
+fn load_params(k: u32) -> ParamsKZG<Bn256> {
+    if !params_path(k).exists() {
+        setup_params(k);
+    }
+    ParamsKZG::<Bn256>::read(&mut File::open(params_path(k)).unwrap()).unwrap()
+}
+
 /// Generates the KZG parameters for degree `k`, replacing any cached ones, and
 /// returns the time it took.
 pub fn setup_params(k: u32) -> std::time::Duration {
@@ -87,7 +95,7 @@ pub fn full_prover<C: Circuit<Fp>>(
 pub fn commit_columns(k: u32, columns: &[Vec<Fp>]) -> (Vec<G1Affine>, std::time::Duration) {
     use halo2_proofs::halo2curves::group::Curve;
     use halo2_proofs::poly::{commitment::Blind, EvaluationDomain};
-    let params = ParamsKZG::<Bn256>::read(&mut File::open(params_path(k)).unwrap()).unwrap();
+    let params = load_params(k);
     let domain = EvaluationDomain::<Fp>::new(1, k);
     let start = Instant::now();
     let commitments = columns
@@ -108,7 +116,8 @@ pub fn commit_columns(k: u32, columns: &[Vec<Fp>]) -> (Vec<G1Affine>, std::time:
 fn binds(proof: &[u8], num_advice: usize, bound: &[(usize, G1Affine)]) -> bool {
     use halo2_proofs::transcript::TranscriptRead;
     let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof);
-    let advice: Result<Vec<G1Affine>, _> = (0..num_advice).map(|_| transcript.read_point()).collect();
+    let advice: Result<Vec<G1Affine>, _> =
+        (0..num_advice).map(|_| transcript.read_point()).collect();
     advice.is_ok_and(|advice| bound.iter().all(|&(i, c)| advice.get(i) == Some(&c)))
 }
 
@@ -122,17 +131,7 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
     bound: &[(usize, G1Affine)],
     proof_path: &str,
 ) -> BenchResult {
-    let params_time_start = Instant::now();
-    let params_path = params_path(k);
-    if !params_path.exists() {
-        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
-        let mut fd = std::fs::File::create(&params_path).unwrap();
-        params.write(&mut fd).unwrap();
-        println!("Time to generate params {:?}", params_time_start.elapsed());
-    }
-
-    let mut fd = std::fs::File::open(&params_path).unwrap();
-    let params = ParamsKZG::<Bn256>::read(&mut fd).unwrap();
+    let params = load_params(k);
 
     let vk_time_start = Instant::now();
     let vk = keygen_vk(&params, &circuit).unwrap();
@@ -200,9 +199,14 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
         );
         let num_advice = pk.get_vk().cs().num_advice_columns();
         let bound_ok = binds(&proof, num_advice, bound);
-        (result.map_err(|e| format!("{e:?}")).and_then(|()| {
-            bound_ok.then_some(()).ok_or_else(|| "the tables are not the committed ones".to_string())
-        }), start.elapsed())
+        (
+            result.map_err(|e| format!("{e:?}")).and_then(|()| {
+                bound_ok
+                    .then_some(())
+                    .ok_or_else(|| "the tables are not the committed ones".to_string())
+            }),
+            start.elapsed(),
+        )
     };
     // Verification repeats for up to a second; the median is reported.
     let (verify_result, first) = verify();
@@ -226,7 +230,7 @@ pub fn full_prover_columns<C: Circuit<Fp>>(
         verify_time_s: verify_time.as_secs_f64(),
         proof_size_bytes: proof.len(),
         verified: verify_result.is_ok(),
-        params_bytes: std::fs::metadata(&params_path).map_or(0, |m| m.len()),
+        params_bytes: std::fs::metadata(params_path(k)).map_or(0, |m| m.len()),
         vk_bytes,
         pk_bytes,
     }

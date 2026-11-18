@@ -1,5 +1,6 @@
-//! TPC-H queries (TruthTable's `_pgn` variants) rebuilt from sound gadgets,
-//! in place of the `*_final_kzg` circuits:
+//! TPC-H Q3, Q5, Q8, Q9 and Q18 (TruthTable's `_pgn` variants; Q1 is in
+//! `q1_fixed_kzg`) rebuilt from sound gadgets, in place of the `*_final_kzg`
+//! circuits:
 //!
 //! - the tables are the circuit's first advice columns, unblinded, so the
 //!   proof is bound to the data owner's commitments;
@@ -18,9 +19,10 @@
 //!
 //! Prices and rates are integer cents, as in the `_poneglyph` tables, so
 //! `1 - l_discount` is negative: the field carries a negative value `x` as
-//! `p - |x|`. A string is its bytes, big-endian, as one field element: every
-//! string here has at most 31 bytes, so equal strings are equal elements and
-//! strings order as their elements do.
+//! `p - |x|`. A string is one field element (see [`string`]).
+//!
+//! Every join key must lie below 2^24, every TPC-H key does at the scale
+//! factors run here; a larger key fails to prove, it cannot join wrongly.
 
 use super::micro_kzg::{
     cur, next, one, prefix_flag, prev, prove_fields, Field, MicroResult, OutputConfig,
@@ -135,7 +137,7 @@ pub struct Rel {
 
 /// The paper's primary-key/foreign-key join, along the foreign-key rows.
 #[derive(Clone, Debug)]
-pub struct JoinConfig<F: Field> {
+pub struct JoinConfig<F: Field, const N: usize = KEY_BYTES> {
     /// The foreign-key rows that join.
     pub joins: Column<Advice>,
     other: Column<Advice>,
@@ -149,10 +151,10 @@ pub struct JoinConfig<F: Field> {
     distinct: Column<Advice>,
     merged: Column<Advice>,
     merged_flag: Column<Advice>,
-    lt: LtEqGenericConfig<F, KEY_BYTES>,
+    lt: LtEqGenericConfig<F, N>,
 }
 
-impl<F: Field> JoinConfig<F> {
+impl<F: Field, const N: usize> JoinConfig<F, N> {
     /// Joins `fk` (its `fk_key` column, its rows valid by `fk.valid`) to `pk`
     /// (its `pk_key`, valid by `pk.valid`), looking up `pk_attrs`.
     pub fn configure(
@@ -267,7 +269,7 @@ impl<F: Field> JoinConfig<F> {
     pub fn assign(
         &self,
         region: &mut Region<'_, F>,
-        lt: &LtEqGenericChip<F, KEY_BYTES>,
+        lt: &LtEqGenericChip<F, N>,
         fk_keys: &[i128],
         fk_valid: &[bool],
         pk_keys: &[i128],
@@ -345,7 +347,7 @@ impl<F: Field> JoinConfig<F> {
 
 /// GROUP BY a key with running sums, over a relation's valid rows.
 #[derive(Clone, Debug)]
-pub struct GroupConfig<F: Field> {
+pub struct GroupConfig<F: Field, const N: usize = SORT_BYTES> {
     q_s: Selector,
     q_s_next: Selector,
     q_first: Selector,
@@ -356,13 +358,13 @@ pub struct GroupConfig<F: Field> {
     same: Column<Advice>,
     end: Column<Advice>,
     sums: Vec<Column<Advice>>,
-    order: LtEqGenericConfig<F, SORT_BYTES>,
+    order: LtEqGenericConfig<F, N>,
     same_key: IsZeroConfig<F>,
     pub output: OutputConfig,
     carries: usize,
 }
 
-impl<F: Field> GroupConfig<F> {
+impl<F: Field, const N: usize> GroupConfig<F, N> {
     /// Groups `rel`'s valid rows by `key` (below 2^80); `carry` are columns
     /// constant within a group, output beside the key, and `terms` the summed
     /// columns. The output is (key, carries..., sums...).
@@ -478,7 +480,7 @@ impl<F: Field> GroupConfig<F> {
     pub fn assign(
         &self,
         region: &mut Region<'_, F>,
-        order: &LtEqGenericChip<F, SORT_BYTES>,
+        order: &LtEqGenericChip<F, N>,
         rows: &[(bool, Vec<i128>)],
         n: usize,
     ) -> Result<Vec<Vec<i128>>, Error> {
@@ -541,11 +543,11 @@ impl<F: Field> GroupConfig<F> {
 /// The output order: per output row, a value that must not decrease. `key`
 /// packs the order columns, each made non-negative and below its bound.
 #[derive(Clone, Debug)]
-pub struct OrderConfig<F: Field> {
-    lt: LtEqGenericConfig<F, SORT_BYTES>,
+pub struct OrderConfig<F: Field, const N: usize = SORT_BYTES> {
+    lt: LtEqGenericConfig<F, N>,
 }
 
-impl<F: Field> OrderConfig<F> {
+impl<F: Field, const N: usize> OrderConfig<F, N> {
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
         output: &OutputConfig,
@@ -1140,6 +1142,1275 @@ pub fn run_q18(k: u32, tables: &Q18Tables, proof_path: &str) -> MicroResult {
     prove_fields(circuit, k, public, Some(table), proof_path)
 }
 
+// ---------------------------------------------------------------------------
+// Q5: six tables, revenue per ASIA nation where customer and supplier share
+// it, by revenue descending.
+// ---------------------------------------------------------------------------
+
+/// `DATE '1994-01-01'` and `DATE '1995-01-01'`.
+const Q5_FROM: i128 = 8766;
+const Q5_TO: i128 = 9131;
+
+/// The tables, in commitment order.
+pub struct Q5Tables {
+    pub customer: [Col; 2], // c_custkey, c_nationkey
+    pub orders: [Col; 3],   // o_orderkey, o_custkey, o_orderdate
+    pub lineitem: [Col; 4], // l_orderkey, l_suppkey, l_extendedprice, l_discount
+    pub supplier: [Col; 2], // s_suppkey, s_nationkey
+    pub nation: [Col; 3],   // n_nationkey, n_name, n_regionkey
+    pub region: [Col; 2],   // r_regionkey, r_name
+}
+
+#[derive(Clone, Debug)]
+pub struct Q5Config<F: Field> {
+    table: Vec<Column<Advice>>,
+    rels: [Rel; 6],
+    from: LtEqGenericConfig<F, KEY_BYTES>,
+    to: LtEqGenericConfig<F, KEY_BYTES>,
+    asia: IsZeroConfig<F>,
+    same_nation: IsZeroConfig<F>,
+    shared: Column<Advice>,
+    revenue: Column<Advice>,
+    joins: [JoinConfig<F>; 5],
+    group: GroupConfig<F, 15>,
+    order: OrderConfig<F, 10>,
+}
+
+#[derive(Clone, Default)]
+pub struct Q5Circuit<F> {
+    pub columns: Vec<Vec<i128>>,
+    pub sizes: [usize; 6],
+    _f: PhantomData<F>,
+}
+
+const Q5_TABLES: [std::ops::Range<usize>; 6] = [0..2, 2..5, 5..9, 9..11, 11..14, 14..16];
+
+impl<F: Field> Q5Circuit<F> {
+    pub fn new(t: &Q5Tables) -> Self {
+        let tables: [&[Col]; 6] = [
+            &t.customer,
+            &t.orders,
+            &t.lineitem,
+            &t.supplier,
+            &t.nation,
+            &t.region,
+        ];
+        Self {
+            sizes: tables.map(|cols| cols[0].len()),
+            columns: tables
+                .iter()
+                .flat_map(|cols| cols.iter().map(Col::values))
+                .collect(),
+            _f: PhantomData,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        let [c, o, l, s, n, r] = self.sizes;
+        [l, r + n, c + o, o + l, s + l, n + l]
+            .into_iter()
+            .max()
+            .unwrap()
+    }
+
+    /// (n_name, revenue), by revenue descending.
+    pub fn result(&self) -> Vec<Vec<i128>> {
+        let c = &self.columns;
+        let [nc, no, nl, ns, nn, nr] = self.sizes;
+        let asia = string("ASIA");
+        let regions: BTreeSet<i128> = (0..nr)
+            .filter(|&r| c[15][r] == asia)
+            .map(|r| c[14][r])
+            .collect();
+        let nations: HashMap<i128, i128> = (0..nn)
+            .filter(|&r| regions.contains(&c[13][r]))
+            .map(|r| (c[11][r], c[12][r]))
+            .collect();
+        let customers: HashMap<i128, i128> = (0..nc).map(|r| (c[0][r], c[1][r])).collect();
+        let orders: HashMap<i128, i128> = (0..no)
+            .filter(|&r| (Q5_FROM..Q5_TO).contains(&c[4][r]))
+            .filter_map(|r| customers.get(&c[3][r]).map(|&n| (c[2][r], n)))
+            .collect();
+        let suppliers: HashMap<i128, i128> = (0..ns).map(|r| (c[9][r], c[10][r])).collect();
+        let mut groups: std::collections::BTreeMap<i128, i128> = Default::default();
+        for r in 0..nl {
+            let (Some(&cn), Some(&sn)) = (orders.get(&c[5][r]), suppliers.get(&c[6][r])) else {
+                continue;
+            };
+            if cn != sn {
+                continue;
+            }
+            if let Some(&name) = nations.get(&sn) {
+                *groups.entry(name).or_default() += c[7][r] * (1 - c[8][r]);
+            }
+        }
+        let mut out: Vec<Vec<i128>> = groups.into_iter().map(|(n, rev)| vec![n, rev]).collect();
+        out.sort_by_key(|g| -g[1]);
+        out
+    }
+}
+
+impl<F: Field> Circuit<F> for Q5Circuit<F> {
+    type Config = Q5Config<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            columns: vec![],
+            sizes: [0; 6],
+            _f: PhantomData,
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let table: Vec<_> = (0..16).map(|_| meta.unblinded_advice_column()).collect();
+        let rels = Q5_TABLES.map(|range| Rel {
+            q: meta.complex_selector(),
+            valid: meta.advice_column(),
+            cols: table[range].to_vec(),
+        });
+        let [customer, orders, lineitem, supplier, nation, region] = rels.clone();
+        for rel in [&customer, &lineitem, &supplier, &nation] {
+            let (q, v) = (rel.q, rel.valid);
+            meta.create_gate("every row is valid", move |m| {
+                vec![m.query_selector(q) * (cur(m, v) - one())]
+            });
+        }
+        let (qo, od) = (orders.q, table[4]);
+        let from = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(qo),
+            |_| vec![constant(Q5_FROM)],
+            |m| vec![cur(m, od)],
+        );
+        let to = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(qo),
+            |m| vec![cur(m, od), one()],
+            |_| vec![constant(Q5_TO)],
+        );
+        let ov = orders.valid;
+        meta.create_gate("orders filter", move |m| {
+            vec![m.query_selector(qo) * (cur(m, ov) - from.is_lt(m, None) * to.is_lt(m, None))]
+        });
+        let (qr, rn, rv) = (region.q, table[15], region.valid);
+        let inv = meta.advice_column();
+        let asia = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(qr),
+            |m| cur(m, rn) - constant(string("ASIA")),
+            inv,
+        );
+        let asia_expr = asia.expr();
+        meta.create_gate("region filter", move |m| {
+            vec![m.query_selector(qr) * (cur(m, rv) - asia_expr.clone())]
+        });
+
+        let j_nr = JoinConfig::configure(meta, &nation, table[13], &region, table[14], &[]);
+        let j_oc = JoinConfig::configure(meta, &orders, table[3], &customer, table[0], &[table[1]]);
+        let orders_ok = Rel {
+            q: orders.q,
+            valid: j_oc.joins,
+            cols: vec![],
+        };
+        let j_lo = JoinConfig::configure(
+            meta,
+            &lineitem,
+            table[5],
+            &orders_ok,
+            table[2],
+            &[j_oc.attrs[0]],
+        );
+        let lineitem_o = Rel {
+            q: lineitem.q,
+            valid: j_lo.joins,
+            cols: vec![],
+        };
+        let j_ls = JoinConfig::configure(
+            meta,
+            &lineitem_o,
+            table[6],
+            &supplier,
+            table[9],
+            &[table[10]],
+        );
+        let (ql, cn, sn, ls) = (lineitem.q, j_lo.attrs[0], j_ls.attrs[0], j_ls.joins);
+        let inv = meta.advice_column();
+        let same_nation = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(ql),
+            |m| cur(m, cn) - cur(m, sn),
+            inv,
+        );
+        let shared = meta.advice_column();
+        let same_expr = same_nation.expr();
+        meta.create_gate("customer and supplier share a nation", move |m| {
+            vec![m.query_selector(ql) * (cur(m, shared) - cur(m, ls) * same_expr.clone())]
+        });
+        let lineitem_s = Rel {
+            q: lineitem.q,
+            valid: shared,
+            cols: vec![],
+        };
+        let nation_ok = Rel {
+            q: nation.q,
+            valid: j_nr.joins,
+            cols: vec![],
+        };
+        let j_ln =
+            JoinConfig::configure(meta, &lineitem_s, sn, &nation_ok, table[11], &[table[12]]);
+        let revenue = meta.advice_column();
+        let (price, disc) = (table[7], table[8]);
+        meta.create_gate("revenue", move |m| {
+            vec![m.query_selector(ql) * (cur(m, revenue) - cur(m, price) * (one() - cur(m, disc)))]
+        });
+        let joined = Rel {
+            q: lineitem.q,
+            valid: j_ln.joins,
+            cols: vec![],
+        };
+        let group = GroupConfig::configure(meta, &joined, j_ln.attrs[0], &[], &[revenue]);
+        let out = group.output.columns.clone();
+        let order = OrderConfig::configure(meta, &group.output, move |m, rot| {
+            constant(REV_OFFSET) - m.query_advice(out[1], rot)
+        });
+        Q5Config {
+            table,
+            rels,
+            from,
+            to,
+            asia,
+            same_nation,
+            shared,
+            revenue,
+            joins: [j_nr, j_oc, j_lo, j_ls, j_ln],
+            group,
+            order,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let j = &config.joins;
+        let key_chips = comparisons(
+            &[
+                config.from,
+                config.to,
+                j[0].lt,
+                j[1].lt,
+                j[2].lt,
+                j[3].lt,
+                j[4].lt,
+            ],
+            &mut layouter,
+        )?;
+        let group_chip = &comparisons(&[config.group.order], &mut layouter)?[0];
+        let order_chip = &comparisons(&[config.order.lt], &mut layouter)?[0];
+        let asia = IsZeroChip::construct(config.asia.clone());
+        let same_nation = IsZeroChip::construct(config.same_nation.clone());
+        let [nc, no, nl, ns, nn, nr] = self.sizes;
+        let n = self.rows();
+        let c = &self.columns;
+        let groups = self.result();
+        let result: Vec<Vec<F>> = groups
+            .iter()
+            .map(|g| g.iter().map(|&v| signed(v)).collect())
+            .collect();
+        let cells = layouter.assign_region(
+            || "q5",
+            |mut region| {
+                for (i, col) in c.iter().enumerate() {
+                    for (row, &v) in col.iter().enumerate() {
+                        put(&mut region, config.table[i], row, v)?;
+                    }
+                }
+                let asia_code = string("ASIA");
+                let mut valid: Vec<Vec<bool>> = self.sizes.iter().map(|&s| vec![true; s]).collect();
+                for (t, rel) in config.rels.iter().enumerate() {
+                    for row in 0..self.sizes[t] {
+                        rel.q.enable(&mut region, row)?;
+                    }
+                }
+                for row in 0..no {
+                    let d = c[4][row];
+                    key_chips[0].assign(&mut region, row, &[signed(Q5_FROM)], &[signed(d)])?;
+                    key_chips[1].assign(
+                        &mut region,
+                        row,
+                        &[signed(d), F::ONE],
+                        &[signed(Q5_TO)],
+                    )?;
+                    valid[1][row] = (Q5_FROM..Q5_TO).contains(&d);
+                }
+                for row in 0..nr {
+                    asia.assign(
+                        &mut region,
+                        row,
+                        Value::known(signed::<F>(c[15][row] - asia_code)),
+                    )?;
+                    valid[5][row] = c[15][row] == asia_code;
+                }
+                for (t, rel) in config.rels.iter().enumerate() {
+                    for row in 0..self.sizes[t] {
+                        put(&mut region, rel.valid, row, valid[t][row] as i128)?;
+                    }
+                }
+                let flags =
+                    |j: &[Option<Vec<i128>>]| j.iter().map(Option::is_some).collect::<Vec<bool>>();
+                let attr = |j: &[Option<Vec<i128>>]| {
+                    j.iter()
+                        .map(|a| a.as_ref().map_or(0, |a| a[0]))
+                        .collect::<Vec<i128>>()
+                };
+                let nr_j = j[0].assign(
+                    &mut region,
+                    &key_chips[2],
+                    &c[13],
+                    &valid[4],
+                    &c[14],
+                    &valid[5],
+                    &[],
+                    nr + nn,
+                )?;
+                let oc_j = j[1].assign(
+                    &mut region,
+                    &key_chips[3],
+                    &c[3],
+                    &valid[1],
+                    &c[0],
+                    &valid[0],
+                    &[c[1].clone()],
+                    nc + no,
+                )?;
+                let lo_j = j[2].assign(
+                    &mut region,
+                    &key_chips[4],
+                    &c[5],
+                    &valid[2],
+                    &c[2],
+                    &flags(&oc_j),
+                    &[attr(&oc_j)],
+                    no + nl,
+                )?;
+                let ls_j = j[3].assign(
+                    &mut region,
+                    &key_chips[5],
+                    &c[6],
+                    &flags(&lo_j),
+                    &c[9],
+                    &valid[3],
+                    &[c[10].clone()],
+                    ns + nl,
+                )?;
+                let (cn, sn) = (attr(&lo_j), attr(&ls_j));
+                let mut shared = vec![false; nl];
+                for row in 0..nl {
+                    same_nation.assign(
+                        &mut region,
+                        row,
+                        Value::known(signed::<F>(cn[row] - sn[row])),
+                    )?;
+                    shared[row] = ls_j[row].is_some() && cn[row] == sn[row];
+                    put(&mut region, config.shared, row, shared[row] as i128)?;
+                    put(
+                        &mut region,
+                        config.revenue,
+                        row,
+                        c[7][row] * (1 - c[8][row]),
+                    )?;
+                }
+                let ln_j = j[4].assign(
+                    &mut region,
+                    &key_chips[6],
+                    &sn,
+                    &shared,
+                    &c[11],
+                    &flags(&nr_j),
+                    &[c[12].clone()],
+                    nn + nl,
+                )?;
+                let rows: Vec<(bool, Vec<i128>)> = (0..nl)
+                    .map(|r| match &ln_j[r] {
+                        Some(a) => (true, vec![a[0], c[7][r] * (1 - c[8][r])]),
+                        None => (false, vec![0; 2]),
+                    })
+                    .collect();
+                config.group.assign(&mut region, group_chip, &rows, n)?;
+                let key = |r: usize| REV_OFFSET - groups.get(r).map_or(0, |g| g[1]);
+                for row in 1..n {
+                    order_chip.assign(
+                        &mut region,
+                        row,
+                        &[signed(key(row - 1))],
+                        &[signed(key(row))],
+                    )?;
+                }
+                config.group.output.assign_fields(&mut region, n, &result)
+            },
+        )?;
+        config.group.output.publish(&mut layouter, &cells)
+    }
+}
+
+/// Proves and verifies Q5 at degree `k`, bound to the data owner's
+/// commitments to the tables.
+pub fn run_q5(k: u32, tables: &Q5Tables, proof_path: &str) -> MicroResult {
+    let circuit = Q5Circuit::<Fp>::new(tables);
+    let public = transpose(&circuit.result(), 2);
+    let table = circuit.columns.iter().map(|c| pad(c)).collect();
+    prove_fields(circuit, k, public, Some(table), proof_path)
+}
+
+// ---------------------------------------------------------------------------
+// Q9: profit per nation and year, over every lineitem.
+// ---------------------------------------------------------------------------
+
+/// The largest order year; years lie within 255 below it, so a group key
+/// `name * 2^8 + (YEAR_TOP - year)` is injective and orders by name, then
+/// year descending.
+const YEAR_TOP: i128 = 2047;
+/// Bytes of a comparison of a partsupp key `partkey * 2^24 + suppkey`.
+const PAIR_BYTES: usize = 6;
+/// Bytes of a comparison of a Q9 group key: a nation name of at most 15
+/// ASCII bytes and the year byte.
+const NAME_YEAR_BYTES: usize = 16;
+
+/// The tables, in commitment order.
+pub struct Q9Tables {
+    pub part: [Col; 1],     // p_partkey
+    pub supplier: [Col; 2], // s_suppkey, s_nationkey
+    // l_orderkey, l_partkey, l_suppkey, l_quantity, l_extendedprice, l_discount
+    pub lineitem: [Col; 6],
+    pub partsupp: [Col; 3], // ps_partkey, ps_suppkey, ps_supplycost
+    pub orders: [Col; 2],   // o_orderkey, o_orderdate_year
+    pub nation: [Col; 2],   // n_nationkey, n_name
+}
+
+#[derive(Clone, Debug)]
+pub struct Q9Config<F: Field> {
+    table: Vec<Column<Advice>>,
+    rels: [Rel; 6],
+    year: LtEqGenericConfig<F, 1>,
+    l_pair: Column<Advice>,
+    ps_pair: Column<Advice>,
+    amount: Column<Advice>,
+    key: Column<Advice>,
+    joins: [JoinConfig<F>; 4],
+    join_ps: JoinConfig<F, PAIR_BYTES>,
+    group: GroupConfig<F, NAME_YEAR_BYTES>,
+    order: OrderConfig<F, NAME_YEAR_BYTES>,
+}
+
+#[derive(Clone, Default)]
+pub struct Q9Circuit<F> {
+    pub columns: Vec<Vec<i128>>,
+    pub sizes: [usize; 6],
+    _f: PhantomData<F>,
+}
+
+const Q9_TABLES: [std::ops::Range<usize>; 6] = [0..1, 1..3, 3..9, 9..12, 12..14, 14..16];
+
+impl<F: Field> Q9Circuit<F> {
+    pub fn new(t: &Q9Tables) -> Self {
+        let tables: [&[Col]; 6] = [
+            &t.part,
+            &t.supplier,
+            &t.lineitem,
+            &t.partsupp,
+            &t.orders,
+            &t.nation,
+        ];
+        Self {
+            sizes: tables.map(|cols| cols[0].len()),
+            columns: tables
+                .iter()
+                .flat_map(|cols| cols.iter().map(Col::values))
+                .collect(),
+            _f: PhantomData,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        let [p, s, l, ps, o, n] = self.sizes;
+        [l + p, l + s, l + ps, l + o, l + n]
+            .into_iter()
+            .max()
+            .unwrap()
+    }
+
+    /// (group key, n_name, o_orderdate_year, sum_profit), by name, then year
+    /// descending.
+    pub fn result(&self) -> Vec<Vec<i128>> {
+        let c = &self.columns;
+        let [np, ns, nl, nps, no, nn] = self.sizes;
+        let parts: BTreeSet<i128> = c[0][..np].iter().copied().collect();
+        let suppliers: HashMap<i128, i128> = (0..ns).map(|r| (c[1][r], c[2][r])).collect();
+        let costs: HashMap<(i128, i128), i128> =
+            (0..nps).map(|r| ((c[9][r], c[10][r]), c[11][r])).collect();
+        let years: HashMap<i128, i128> = (0..no).map(|r| (c[12][r], c[13][r])).collect();
+        let names: HashMap<i128, i128> = (0..nn).map(|r| (c[14][r], c[15][r])).collect();
+        let mut groups: std::collections::BTreeMap<i128, (i128, i128, i128)> = Default::default();
+        for r in 0..nl {
+            let (Some(&nation), Some(&cost), Some(&year)) = (
+                suppliers.get(&c[5][r]),
+                costs.get(&(c[4][r], c[5][r])),
+                years.get(&c[3][r]),
+            ) else {
+                continue;
+            };
+            let Some(&name) = names.get(&nation) else {
+                continue;
+            };
+            if !parts.contains(&c[4][r]) {
+                continue;
+            }
+            let amount = c[7][r] * (1 - c[8][r]) - cost * c[6][r];
+            groups
+                .entry((name << 8) + YEAR_TOP - year)
+                .or_insert((name, year, 0))
+                .2 += amount;
+        }
+        groups
+            .into_iter()
+            .map(|(k, (n, y, s))| vec![k, n, y, s])
+            .collect()
+    }
+}
+
+impl<F: Field> Circuit<F> for Q9Circuit<F> {
+    type Config = Q9Config<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            columns: vec![],
+            sizes: [0; 6],
+            _f: PhantomData,
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let table: Vec<_> = (0..16).map(|_| meta.unblinded_advice_column()).collect();
+        let rels = Q9_TABLES.map(|range| Rel {
+            q: meta.complex_selector(),
+            valid: meta.advice_column(),
+            cols: table[range].to_vec(),
+        });
+        let [part, supplier, lineitem, partsupp, orders, nation] = rels.clone();
+        for rel in &rels {
+            let (q, v) = (rel.q, rel.valid);
+            meta.create_gate("every row is valid", move |m| {
+                vec![m.query_selector(q) * (cur(m, v) - one())]
+            });
+        }
+        let (qo, oy) = (orders.q, table[13]);
+        let year = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(qo),
+            |_| vec![constant(YEAR_TOP - 255)],
+            |m| vec![cur(m, oy)],
+        );
+        meta.create_gate("years lie in the key's year byte", move |m| {
+            vec![m.query_selector(qo) * (year.is_lt(m, None) - one())]
+        });
+        let (l_pair, ps_pair) = (meta.advice_column(), meta.advice_column());
+        let (ql, lp, ls) = (lineitem.q, table[4], table[5]);
+        meta.create_gate("lineitem's partsupp key", move |m| {
+            vec![
+                m.query_selector(ql)
+                    * (cur(m, l_pair) - cur(m, lp) * constant(1 << 24) - cur(m, ls)),
+            ]
+        });
+        let (qps, pp, psu) = (partsupp.q, table[9], table[10]);
+        meta.create_gate("partsupp's key", move |m| {
+            vec![
+                m.query_selector(qps)
+                    * (cur(m, ps_pair) - cur(m, pp) * constant(1 << 24) - cur(m, psu)),
+            ]
+        });
+
+        let j_lp = JoinConfig::configure(meta, &lineitem, table[4], &part, table[0], &[]);
+        let after = |j: &Column<Advice>| Rel {
+            q: lineitem.q,
+            valid: *j,
+            cols: vec![],
+        };
+        let j_ls = JoinConfig::configure(
+            meta,
+            &after(&j_lp.joins),
+            table[5],
+            &supplier,
+            table[1],
+            &[table[2]],
+        );
+        let join_ps = JoinConfig::configure(
+            meta,
+            &after(&j_ls.joins),
+            l_pair,
+            &partsupp,
+            ps_pair,
+            &[table[11]],
+        );
+        let j_lo = JoinConfig::configure(
+            meta,
+            &after(&join_ps.joins),
+            table[3],
+            &orders,
+            table[12],
+            &[table[13]],
+        );
+        let j_ln = JoinConfig::configure(
+            meta,
+            &after(&j_lo.joins),
+            j_ls.attrs[0],
+            &nation,
+            table[14],
+            &[table[15]],
+        );
+
+        let amount = meta.advice_column();
+        let (qty, price, disc, cost) = (table[6], table[7], table[8], join_ps.attrs[0]);
+        meta.create_gate("amount", move |m| {
+            let volume = cur(m, price) * (one() - cur(m, disc));
+            vec![m.query_selector(ql) * (cur(m, amount) - volume + cur(m, cost) * cur(m, qty))]
+        });
+        let key = meta.advice_column();
+        let (name, y) = (j_ln.attrs[0], j_lo.attrs[0]);
+        meta.create_gate("group key", move |m| {
+            let packed = cur(m, name) * constant(1 << 8) + constant(YEAR_TOP) - cur(m, y);
+            vec![m.query_selector(ql) * (cur(m, key) - packed)]
+        });
+        let group = GroupConfig::configure(meta, &after(&j_ln.joins), key, &[name, y], &[amount]);
+        let out = group.output.columns.clone();
+        let order = OrderConfig::configure(meta, &group.output, move |m, rot| {
+            m.query_advice(out[0], rot)
+        });
+        Q9Config {
+            table,
+            rels,
+            year,
+            l_pair,
+            ps_pair,
+            amount,
+            key,
+            joins: [j_lp, j_ls, j_lo, j_ln],
+            join_ps,
+            group,
+            order,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let j = &config.joins;
+        let key_chips = comparisons(&[j[0].lt, j[1].lt, j[2].lt, j[3].lt], &mut layouter)?;
+        let pair_chip = &comparisons(&[config.join_ps.lt], &mut layouter)?[0];
+        let year_chip = &comparisons(&[config.year], &mut layouter)?[0];
+        let sort_chips = comparisons(&[config.group.order, config.order.lt], &mut layouter)?;
+        let [np, ns, nl, nps, no, nn] = self.sizes;
+        let n = self.rows();
+        let c = &self.columns;
+        let groups = self.result();
+        let result: Vec<Vec<F>> = groups
+            .iter()
+            .map(|g| g.iter().map(|&v| signed(v)).collect())
+            .collect();
+        let cells = layouter.assign_region(
+            || "q9",
+            |mut region| {
+                for (i, col) in c.iter().enumerate() {
+                    for (row, &v) in col.iter().enumerate() {
+                        put(&mut region, config.table[i], row, v)?;
+                    }
+                }
+                for (rel, &size) in config.rels.iter().zip(&self.sizes) {
+                    for row in 0..size {
+                        rel.q.enable(&mut region, row)?;
+                        put(&mut region, rel.valid, row, 1)?;
+                    }
+                }
+                for row in 0..no {
+                    year_chip.assign(
+                        &mut region,
+                        row,
+                        &[signed(YEAR_TOP - 255)],
+                        &[signed(c[13][row])],
+                    )?;
+                }
+                let l_pairs: Vec<i128> = (0..nl).map(|r| (c[4][r] << 24) + c[5][r]).collect();
+                let ps_pairs: Vec<i128> = (0..nps).map(|r| (c[9][r] << 24) + c[10][r]).collect();
+                for (row, &v) in l_pairs.iter().enumerate() {
+                    put(&mut region, config.l_pair, row, v)?;
+                }
+                for (row, &v) in ps_pairs.iter().enumerate() {
+                    put(&mut region, config.ps_pair, row, v)?;
+                }
+                let flags =
+                    |j: &[Option<Vec<i128>>]| j.iter().map(Option::is_some).collect::<Vec<bool>>();
+                let attr = |j: &[Option<Vec<i128>>]| {
+                    j.iter()
+                        .map(|a| a.as_ref().map_or(0, |a| a[0]))
+                        .collect::<Vec<i128>>()
+                };
+                let all = |size: usize| vec![true; size];
+                let lp = j[0].assign(
+                    &mut region,
+                    &key_chips[0],
+                    &c[4],
+                    &all(nl),
+                    &c[0],
+                    &all(np),
+                    &[],
+                    np + nl,
+                )?;
+                let ls = j[1].assign(
+                    &mut region,
+                    &key_chips[1],
+                    &c[5],
+                    &flags(&lp),
+                    &c[1],
+                    &all(ns),
+                    &[c[2].clone()],
+                    ns + nl,
+                )?;
+                let lps = config.join_ps.assign(
+                    &mut region,
+                    pair_chip,
+                    &l_pairs,
+                    &flags(&ls),
+                    &ps_pairs,
+                    &all(nps),
+                    &[c[11].clone()],
+                    nps + nl,
+                )?;
+                let lo = j[2].assign(
+                    &mut region,
+                    &key_chips[2],
+                    &c[3],
+                    &flags(&lps),
+                    &c[12],
+                    &all(no),
+                    &[c[13].clone()],
+                    no + nl,
+                )?;
+                let nation = attr(&ls);
+                let ln = j[3].assign(
+                    &mut region,
+                    &key_chips[3],
+                    &nation,
+                    &flags(&lo),
+                    &c[14],
+                    &all(nn),
+                    &[c[15].clone()],
+                    nn + nl,
+                )?;
+                let (cost, year, name) = (attr(&lps), attr(&lo), attr(&ln));
+                let mut rows = Vec::with_capacity(nl);
+                for r in 0..nl {
+                    let amount = c[7][r] * (1 - c[8][r]) - cost[r] * c[6][r];
+                    let key = (name[r] << 8) + YEAR_TOP - year[r];
+                    put(&mut region, config.amount, r, amount)?;
+                    put(&mut region, config.key, r, key)?;
+                    rows.push((ln[r].is_some(), vec![key, name[r], year[r], amount]));
+                }
+                config.group.assign(&mut region, &sort_chips[0], &rows, n)?;
+                let key = |r: usize| groups.get(r).map_or(0, |g| g[0]);
+                for row in 1..n {
+                    sort_chips[1].assign(
+                        &mut region,
+                        row,
+                        &[signed(key(row - 1))],
+                        &[signed(key(row))],
+                    )?;
+                }
+                config.group.output.assign_fields(&mut region, n, &result)
+            },
+        )?;
+        config.group.output.publish(&mut layouter, &cells)
+    }
+}
+
+/// Proves and verifies Q9 at degree `k`, bound to the data owner's
+/// commitments to the tables.
+pub fn run_q9(k: u32, tables: &Q9Tables, proof_path: &str) -> MicroResult {
+    let circuit = Q9Circuit::<Fp>::new(tables);
+    let public = transpose(&circuit.result(), 4);
+    let table = circuit.columns.iter().map(|c| pad(c)).collect();
+    prove_fields(circuit, k, public, Some(table), proof_path)
+}
+
+// ---------------------------------------------------------------------------
+// Q8: Brazil's share of American volume for one part type, per year.
+// ---------------------------------------------------------------------------
+
+/// `DATE '1995-01-01'` and `DATE '1996-12-31'`, both included.
+const Q8_FROM: i128 = 9131;
+const Q8_TO: i128 = 9861;
+const Q8_TYPE: &str = "ECONOMY ANODIZED STEEL";
+
+/// The tables, in commitment order.
+pub struct Q8Tables {
+    pub part: [Col; 2],     // p_partkey, p_type
+    pub supplier: [Col; 2], // s_suppkey, s_nationkey
+    // l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount
+    pub lineitem: [Col; 5],
+    pub orders: [Col; 4], // o_orderkey, o_custkey, o_orderdate, o_orderdate_year
+    pub customer: [Col; 2], // c_custkey, c_nationkey
+    pub nation: [Col; 3], // n_nationkey, n_name, n_regionkey
+    pub region: [Col; 2], // r_regionkey, r_name
+}
+
+#[derive(Clone, Debug)]
+pub struct Q8Config<F: Field> {
+    table: Vec<Column<Advice>>,
+    rels: [Rel; 7],
+    part_type: IsZeroConfig<F>,
+    america: IsZeroConfig<F>,
+    brazil: IsZeroConfig<F>,
+    from: LtEqGenericConfig<F, KEY_BYTES>,
+    to: LtEqGenericConfig<F, KEY_BYTES>,
+    volume: Column<Advice>,
+    brazil_volume: Column<Advice>,
+    joins: [JoinConfig<F>; 7],
+    group: GroupConfig<F, KEY_BYTES>,
+    order: OrderConfig<F, KEY_BYTES>,
+}
+
+#[derive(Clone, Default)]
+pub struct Q8Circuit<F> {
+    pub columns: Vec<Vec<i128>>,
+    pub sizes: [usize; 7],
+    _f: PhantomData<F>,
+}
+
+const Q8_TABLES: [std::ops::Range<usize>; 7] = [0..2, 2..4, 4..9, 9..13, 13..15, 15..18, 18..20];
+
+impl<F: Field> Q8Circuit<F> {
+    pub fn new(t: &Q8Tables) -> Self {
+        let tables: [&[Col]; 7] = [
+            &t.part,
+            &t.supplier,
+            &t.lineitem,
+            &t.orders,
+            &t.customer,
+            &t.nation,
+            &t.region,
+        ];
+        Self {
+            sizes: tables.map(|cols| cols[0].len()),
+            columns: tables
+                .iter()
+                .flat_map(|cols| cols.iter().map(Col::values))
+                .collect(),
+            _f: PhantomData,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        let [p, s, l, o, c, n, r] = self.sizes;
+        [n + r, c + n, o + c, l + p, l + o, l + s, l + n]
+            .into_iter()
+            .max()
+            .unwrap()
+    }
+
+    /// (o_orderdate_year, Brazil's volume, all volume), by year.
+    pub fn result(&self) -> Vec<Vec<i128>> {
+        let c = &self.columns;
+        let [np, ns, nl, no, nc, nn, nr] = self.sizes;
+        let america = string("AMERICA");
+        let regions: BTreeSet<i128> = (0..nr)
+            .filter(|&r| c[19][r] == america)
+            .map(|r| c[18][r])
+            .collect();
+        let american: BTreeSet<i128> = (0..nn)
+            .filter(|&r| regions.contains(&c[17][r]))
+            .map(|r| c[15][r])
+            .collect();
+        let names: HashMap<i128, i128> = (0..nn).map(|r| (c[15][r], c[16][r])).collect();
+        let customers: BTreeSet<i128> = (0..nc)
+            .filter(|&r| american.contains(&c[14][r]))
+            .map(|r| c[13][r])
+            .collect();
+        let orders: HashMap<i128, i128> = (0..no)
+            .filter(|&r| (Q8_FROM..=Q8_TO).contains(&c[11][r]) && customers.contains(&c[10][r]))
+            .map(|r| (c[9][r], c[12][r]))
+            .collect();
+        let kind = string(Q8_TYPE);
+        let parts: BTreeSet<i128> = (0..np)
+            .filter(|&r| c[1][r] == kind)
+            .map(|r| c[0][r])
+            .collect();
+        let suppliers: HashMap<i128, i128> = (0..ns).map(|r| (c[2][r], c[3][r])).collect();
+        let brazil = string("BRAZIL");
+        let mut groups: std::collections::BTreeMap<i128, (i128, i128)> = Default::default();
+        for r in 0..nl {
+            let (Some(&year), Some(nation)) = (orders.get(&c[4][r]), suppliers.get(&c[6][r]))
+            else {
+                continue;
+            };
+            let Some(&name) = names.get(nation) else {
+                continue;
+            };
+            if !parts.contains(&c[5][r]) {
+                continue;
+            }
+            let volume = c[7][r] * (1 - c[8][r]);
+            let g = groups.entry(year).or_default();
+            g.0 += if name == brazil { volume } else { 0 };
+            g.1 += volume;
+        }
+        groups
+            .into_iter()
+            .map(|(y, (b, v))| vec![y, b, v])
+            .collect()
+    }
+}
+
+impl<F: Field> Circuit<F> for Q8Circuit<F> {
+    type Config = Q8Config<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self {
+            columns: vec![],
+            sizes: [0; 7],
+            _f: PhantomData,
+        }
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let table: Vec<_> = (0..20).map(|_| meta.unblinded_advice_column()).collect();
+        let rels = Q8_TABLES.map(|range| Rel {
+            q: meta.complex_selector(),
+            valid: meta.advice_column(),
+            cols: table[range].to_vec(),
+        });
+        let [part, supplier, lineitem, orders, customer, nation, region] = rels.clone();
+        for rel in [&supplier, &lineitem, &customer, &nation] {
+            let (q, v) = (rel.q, rel.valid);
+            meta.create_gate("every row is valid", move |m| {
+                vec![m.query_selector(q) * (cur(m, v) - one())]
+            });
+        }
+        let equals =
+            |meta: &mut ConstraintSystem<F>, rel: &Rel, col: Column<Advice>, value: &str| {
+                let (q, v, value) = (rel.q, rel.valid, string(value));
+                let inv = meta.advice_column();
+                let chip = IsZeroChip::configure(
+                    meta,
+                    |m| m.query_selector(q),
+                    |m| cur(m, col) - constant(value),
+                    inv,
+                );
+                let expr = chip.expr();
+                meta.create_gate("equality filter", move |m| {
+                    vec![m.query_selector(q) * (cur(m, v) - expr.clone())]
+                });
+                chip
+            };
+        let part_type = equals(meta, &part, table[1], Q8_TYPE);
+        let america = equals(meta, &region, table[19], "AMERICA");
+        let (qo, od) = (orders.q, table[11]);
+        let from = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(qo),
+            |_| vec![constant(Q8_FROM)],
+            |m| vec![cur(m, od)],
+        );
+        let to = LtEqGenericChip::configure(
+            meta,
+            |m| m.query_selector(qo),
+            |m| vec![cur(m, od)],
+            |_| vec![constant(Q8_TO)],
+        );
+        let ov = orders.valid;
+        meta.create_gate("orders filter", move |m| {
+            vec![m.query_selector(qo) * (cur(m, ov) - from.is_lt(m, None) * to.is_lt(m, None))]
+        });
+
+        let only = |rel: &Rel, valid: Column<Advice>| Rel {
+            q: rel.q,
+            valid,
+            cols: vec![],
+        };
+        let j_nr = JoinConfig::configure(meta, &nation, table[17], &region, table[18], &[]);
+        let j_cn = JoinConfig::configure(
+            meta,
+            &customer,
+            table[14],
+            &only(&nation, j_nr.joins),
+            table[15],
+            &[],
+        );
+        let j_oc = JoinConfig::configure(
+            meta,
+            &orders,
+            table[10],
+            &only(&customer, j_cn.joins),
+            table[13],
+            &[],
+        );
+        let j_lp = JoinConfig::configure(meta, &lineitem, table[5], &part, table[0], &[]);
+        let j_lo = JoinConfig::configure(
+            meta,
+            &only(&lineitem, j_lp.joins),
+            table[4],
+            &only(&orders, j_oc.joins),
+            table[9],
+            &[table[12]],
+        );
+        let j_ls = JoinConfig::configure(
+            meta,
+            &only(&lineitem, j_lo.joins),
+            table[6],
+            &supplier,
+            table[2],
+            &[table[3]],
+        );
+        let j_ln = JoinConfig::configure(
+            meta,
+            &only(&lineitem, j_ls.joins),
+            j_ls.attrs[0],
+            &nation,
+            table[15],
+            &[table[16]],
+        );
+
+        let ql = lineitem.q;
+        let (volume, brazil_volume) = (meta.advice_column(), meta.advice_column());
+        let (price, disc) = (table[7], table[8]);
+        meta.create_gate("volume", move |m| {
+            vec![m.query_selector(ql) * (cur(m, volume) - cur(m, price) * (one() - cur(m, disc)))]
+        });
+        let name = j_ln.attrs[0];
+        let inv = meta.advice_column();
+        let brazil = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(ql),
+            |m| cur(m, name) - constant(string("BRAZIL")),
+            inv,
+        );
+        let brazil_expr = brazil.expr();
+        meta.create_gate("Brazil's volume", move |m| {
+            vec![
+                m.query_selector(ql)
+                    * (cur(m, brazil_volume) - brazil_expr.clone() * cur(m, volume)),
+            ]
+        });
+        let group = GroupConfig::configure(
+            meta,
+            &only(&lineitem, j_ln.joins),
+            j_lo.attrs[0],
+            &[],
+            &[brazil_volume, volume],
+        );
+        let out = group.output.columns.clone();
+        let order = OrderConfig::configure(meta, &group.output, move |m, rot| {
+            m.query_advice(out[0], rot)
+        });
+        Q8Config {
+            table,
+            rels,
+            part_type,
+            america,
+            brazil,
+            from,
+            to,
+            volume,
+            brazil_volume,
+            joins: [j_nr, j_cn, j_oc, j_lp, j_lo, j_ls, j_ln],
+            group,
+            order,
+        }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        let j = &config.joins;
+        let mut chips = vec![config.from, config.to];
+        chips.extend(j.iter().map(|j| j.lt));
+        chips.extend([config.group.order, config.order.lt]);
+        let chips = comparisons(&chips, &mut layouter)?;
+        let (part_type, america, brazil) = (
+            IsZeroChip::construct(config.part_type.clone()),
+            IsZeroChip::construct(config.america.clone()),
+            IsZeroChip::construct(config.brazil.clone()),
+        );
+        let [np, ns, nl, no, nc, nn, nr] = self.sizes;
+        let n = self.rows();
+        let c = &self.columns;
+        let groups = self.result();
+        let result: Vec<Vec<F>> = groups
+            .iter()
+            .map(|g| g.iter().map(|&v| signed(v)).collect())
+            .collect();
+        let cells = layouter.assign_region(
+            || "q8",
+            |mut region| {
+                for (i, col) in c.iter().enumerate() {
+                    for (row, &v) in col.iter().enumerate() {
+                        put(&mut region, config.table[i], row, v)?;
+                    }
+                }
+                let mut valid: Vec<Vec<bool>> = self.sizes.iter().map(|&s| vec![true; s]).collect();
+                for (t, rel) in config.rels.iter().enumerate() {
+                    for row in 0..self.sizes[t] {
+                        rel.q.enable(&mut region, row)?;
+                    }
+                }
+                let kind = string(Q8_TYPE);
+                for row in 0..np {
+                    part_type.assign(
+                        &mut region,
+                        row,
+                        Value::known(signed::<F>(c[1][row] - kind)),
+                    )?;
+                    valid[0][row] = c[1][row] == kind;
+                }
+                for row in 0..no {
+                    let d = c[11][row];
+                    chips[0].assign(&mut region, row, &[signed(Q8_FROM)], &[signed(d)])?;
+                    chips[1].assign(&mut region, row, &[signed(d)], &[signed(Q8_TO)])?;
+                    valid[3][row] = (Q8_FROM..=Q8_TO).contains(&d);
+                }
+                let code = string("AMERICA");
+                for row in 0..nr {
+                    america.assign(
+                        &mut region,
+                        row,
+                        Value::known(signed::<F>(c[19][row] - code)),
+                    )?;
+                    valid[6][row] = c[19][row] == code;
+                }
+                for (t, rel) in config.rels.iter().enumerate() {
+                    for row in 0..self.sizes[t] {
+                        put(&mut region, rel.valid, row, valid[t][row] as i128)?;
+                    }
+                }
+                let flags =
+                    |j: &[Option<Vec<i128>>]| j.iter().map(Option::is_some).collect::<Vec<bool>>();
+                let attr = |j: &[Option<Vec<i128>>]| {
+                    j.iter()
+                        .map(|a| a.as_ref().map_or(0, |a| a[0]))
+                        .collect::<Vec<i128>>()
+                };
+                let nr_j = j[0].assign(
+                    &mut region,
+                    &chips[2],
+                    &c[17],
+                    &valid[5],
+                    &c[18],
+                    &valid[6],
+                    &[],
+                    nn + nr,
+                )?;
+                let cn_j = j[1].assign(
+                    &mut region,
+                    &chips[3],
+                    &c[14],
+                    &valid[4],
+                    &c[15],
+                    &flags(&nr_j),
+                    &[],
+                    nc + nn,
+                )?;
+                let oc_j = j[2].assign(
+                    &mut region,
+                    &chips[4],
+                    &c[10],
+                    &valid[3],
+                    &c[13],
+                    &flags(&cn_j),
+                    &[],
+                    no + nc,
+                )?;
+                let lp_j = j[3].assign(
+                    &mut region,
+                    &chips[5],
+                    &c[5],
+                    &valid[2],
+                    &c[0],
+                    &valid[0],
+                    &[],
+                    nl + np,
+                )?;
+                let lo_j = j[4].assign(
+                    &mut region,
+                    &chips[6],
+                    &c[4],
+                    &flags(&lp_j),
+                    &c[9],
+                    &flags(&oc_j),
+                    &[c[12].clone()],
+                    nl + no,
+                )?;
+                let ls_j = j[5].assign(
+                    &mut region,
+                    &chips[7],
+                    &c[6],
+                    &flags(&lo_j),
+                    &c[2],
+                    &valid[1],
+                    &[c[3].clone()],
+                    nl + ns,
+                )?;
+                let ln_j = j[6].assign(
+                    &mut region,
+                    &chips[8],
+                    &attr(&ls_j),
+                    &flags(&ls_j),
+                    &c[15],
+                    &valid[5],
+                    &[c[16].clone()],
+                    nl + nn,
+                )?;
+                let (year, name) = (attr(&lo_j), attr(&ln_j));
+                let code = string("BRAZIL");
+                let mut rows = Vec::with_capacity(nl);
+                for r in 0..nl {
+                    let volume = c[7][r] * (1 - c[8][r]);
+                    let share = if name[r] == code { volume } else { 0 };
+                    brazil.assign(&mut region, r, Value::known(signed::<F>(name[r] - code)))?;
+                    put(&mut region, config.volume, r, volume)?;
+                    put(&mut region, config.brazil_volume, r, share)?;
+                    rows.push((ln_j[r].is_some(), vec![year[r], share, volume]));
+                }
+                config.group.assign(&mut region, &chips[9], &rows, n)?;
+                let key = |r: usize| groups.get(r).map_or(0, |g| g[0]);
+                for row in 1..n {
+                    chips[10].assign(
+                        &mut region,
+                        row,
+                        &[signed(key(row - 1))],
+                        &[signed(key(row))],
+                    )?;
+                }
+                config.group.output.assign_fields(&mut region, n, &result)
+            },
+        )?;
+        config.group.output.publish(&mut layouter, &cells)
+    }
+}
+
+/// Proves and verifies Q8 at degree `k`, bound to the data owner's
+/// commitments to the tables.
+pub fn run_q8(k: u32, tables: &Q8Tables, proof_path: &str) -> MicroResult {
+    let circuit = Q8Circuit::<Fp>::new(tables);
+    let public = transpose(&circuit.result(), 3);
+    let table = circuit.columns.iter().map(|c| pad(c)).collect();
+    prove_fields(circuit, k, public, Some(table), proof_path)
+}
+
 /// Proves and verifies Q3 at degree `k`, bound to the data owner's
 /// commitments to the tables.
 pub fn run_q3(k: u32, tables: &Q3Tables, proof_path: &str) -> MicroResult {
@@ -1255,6 +2526,261 @@ mod tests {
         assert!(ok(&result));
         let mut wrong = result.clone();
         wrong[0][5] += 1;
+        assert!(!ok(&wrong));
+        assert!(!ok(&result[1..]));
+    }
+
+    fn q5_tables() -> Q5Tables {
+        let mut r = lcg(5);
+        let (nc, no, nl, ns) = (30usize, 80usize, 300usize, 10usize);
+        let names = ["ALGERIA", "CHINA", "INDIA", "JAPAN", "VIETNAM", "FRANCE"];
+        Q5Tables {
+            customer: [
+                Col::Int((1..=nc as i64).collect()),
+                Col::Int((0..nc).map(|_| r(6)).collect()),
+            ],
+            orders: [
+                Col::Int((1..=no as i64).collect()),
+                Col::Int((0..no).map(|_| 1 + r(nc as u64)).collect()),
+                Col::Int((0..no).map(|_| Q5_FROM as i64 - 100 + r(600)).collect()),
+            ],
+            lineitem: [
+                Col::Int((0..nl).map(|_| 1 + r(no as u64)).collect()),
+                Col::Int((0..nl).map(|_| 1 + r(ns as u64)).collect()),
+                Col::Int((0..nl).map(|_| 100 + r(10_000)).collect()),
+                Col::Int((0..nl).map(|_| r(11)).collect()),
+            ],
+            supplier: [
+                Col::Int((1..=ns as i64).collect()),
+                Col::Int((0..ns).map(|_| r(6)).collect()),
+            ],
+            nation: [
+                Col::Int((0..6).collect()),
+                Col::Str(names.iter().map(|s| s.to_string()).collect()),
+                Col::Int(vec![0, 1, 1, 1, 1, 2]),
+            ],
+            region: [
+                Col::Int((0..3).collect()),
+                Col::Str(
+                    ["AFRICA", "ASIA", "EUROPE"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ],
+        }
+    }
+
+    fn q9_tables() -> Q9Tables {
+        let mut r = lcg(9);
+        let (np, ns, no, nl) = (20i64, 8i64, 40usize, 300usize);
+        let pairs: Vec<(i64, i64)> = (1..=np)
+            .flat_map(|p| [(p, 1 + (p % ns)), (p, 1 + ((p + 3) % ns))])
+            .collect();
+        let names = [
+            "ALGERIA",
+            "BRAZIL",
+            "CHINA",
+            "UNITED KINGDOM",
+            "VIETNAM",
+            "FRANCE",
+        ];
+        // A few lineitems name a part or a pair that does not exist.
+        let items: Vec<(i64, i64)> = (0..nl)
+            .map(|i| {
+                if i % 37 == 0 {
+                    (np + 1 + r(3), 1)
+                } else {
+                    pairs[r(pairs.len() as u64) as usize]
+                }
+            })
+            .collect();
+        Q9Tables {
+            part: [Col::Int((1..=np).collect())],
+            supplier: [
+                Col::Int((1..=ns).collect()),
+                Col::Int((0..ns).map(|_| r(6)).collect()),
+            ],
+            lineitem: [
+                Col::Int((0..nl).map(|_| 1 + r(no as u64)).collect()),
+                Col::Int(items.iter().map(|p| p.0).collect()),
+                Col::Int(items.iter().map(|p| p.1).collect()),
+                Col::Int((0..nl).map(|_| 100 * (1 + r(50))).collect()),
+                Col::Int((0..nl).map(|_| 100 + r(10_000)).collect()),
+                Col::Int((0..nl).map(|_| r(11)).collect()),
+            ],
+            partsupp: [
+                Col::Int(pairs.iter().map(|p| p.0).collect()),
+                Col::Int(pairs.iter().map(|p| p.1).collect()),
+                Col::Int(pairs.iter().map(|_| 100 + r(100_000)).collect()),
+            ],
+            orders: [
+                Col::Int((1..=no as i64).collect()),
+                Col::Int((0..no).map(|_| 1992 + r(7)).collect()),
+            ],
+            nation: [
+                Col::Int((0..6).collect()),
+                Col::Str(names.iter().map(|s| s.to_string()).collect()),
+            ],
+        }
+    }
+
+    #[test]
+    fn q9_accepts_its_result_only() {
+        let circuit = Q9Circuit::<Fp>::new(&q9_tables());
+        let result = circuit.result();
+        let k = degree(circuit.rows());
+        let ok = |res: &[Vec<i128>]| {
+            MockProver::run(k, &circuit, transpose(res, 4))
+                .unwrap()
+                .verify()
+                .is_ok()
+        };
+        assert!(result.len() > 1, "too few groups to test with");
+        assert!(ok(&result));
+        let mut wrong = result.clone();
+        wrong[0][3] += 1;
+        assert!(!ok(&wrong));
+        assert!(!ok(&result[1..]));
+        let mut swapped = result.clone();
+        swapped.swap(0, 1);
+        assert!(!ok(&swapped));
+    }
+
+    fn q8_tables() -> Q8Tables {
+        let mut r = lcg(8);
+        let (np, ns, no, nc, nl) = (20usize, 8usize, 60usize, 25usize, 300usize);
+        let types = [Q8_TYPE, "PROMO BRUSHED TIN", "ECONOMY ANODIZED"];
+        let names = ["ARGENTINA", "BRAZIL", "CANADA", "CHINA", "FRANCE", "PERU"];
+        Q8Tables {
+            part: [
+                Col::Int((1..=np as i64).collect()),
+                Col::Str((0..np).map(|_| types[r(3) as usize].to_string()).collect()),
+            ],
+            supplier: [
+                Col::Int((1..=ns as i64).collect()),
+                Col::Int((0..ns).map(|_| r(6)).collect()),
+            ],
+            lineitem: [
+                Col::Int((0..nl).map(|_| 1 + r(no as u64 + 3)).collect()),
+                Col::Int((0..nl).map(|_| 1 + r(np as u64)).collect()),
+                Col::Int((0..nl).map(|_| 1 + r(ns as u64)).collect()),
+                Col::Int((0..nl).map(|_| 100 + r(10_000)).collect()),
+                Col::Int((0..nl).map(|_| r(11)).collect()),
+            ],
+            orders: {
+                let dates: Vec<i64> = (0..no).map(|_| Q8_FROM as i64 - 200 + r(1200)).collect();
+                [
+                    Col::Int((1..=no as i64).collect()),
+                    Col::Int((0..no).map(|_| 1 + r(nc as u64)).collect()),
+                    Col::Int(dates.clone()),
+                    Col::Int(dates.iter().map(|d| 1970 + d / 365).collect()),
+                ]
+            },
+            customer: [
+                Col::Int((1..=nc as i64).collect()),
+                Col::Int((0..nc).map(|_| r(6)).collect()),
+            ],
+            nation: [
+                Col::Int((0..6).collect()),
+                Col::Str(names.iter().map(|s| s.to_string()).collect()),
+                Col::Int(vec![1, 1, 1, 2, 3, 1]),
+            ],
+            region: [
+                Col::Int((0..4).collect()),
+                Col::Str(
+                    ["AFRICA", "AMERICA", "ASIA", "EUROPE"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn q8_accepts_its_result_only() {
+        let circuit = Q8Circuit::<Fp>::new(&q8_tables());
+        let result = circuit.result();
+        let k = degree(circuit.rows());
+        let ok = |res: &[Vec<i128>]| {
+            MockProver::run(k, &circuit, transpose(res, 3))
+                .unwrap()
+                .verify()
+                .is_ok()
+        };
+        assert!(result.len() > 1, "too few groups to test with");
+        assert!(
+            result.iter().any(|g| g[1] != 0 && g[1] != g[2]),
+            "no mixed share to test with"
+        );
+        assert!(ok(&result));
+        let mut wrong = result.clone();
+        wrong[0][1] += 1;
+        assert!(!ok(&wrong));
+        assert!(!ok(&result[1..]));
+        let mut swapped = result.clone();
+        swapped.swap(0, 1);
+        assert!(!ok(&swapped));
+    }
+
+    /// Every query through the real prover and verifier.
+    #[test]
+    fn prove_and_verify() {
+        let path = |q: &str| {
+            std::env::temp_dir()
+                .join(format!("fixed_{q}.proof"))
+                .display()
+                .to_string()
+        };
+        let k = |rows: usize| degree(rows);
+        let q3 = q3_tables();
+        assert!(
+            run_q3(k(Q3Circuit::<Fp>::new(&q3).rows()), &q3, &path("q3"))
+                .bench
+                .verified
+        );
+        let q5 = q5_tables();
+        assert!(
+            run_q5(k(Q5Circuit::<Fp>::new(&q5).rows()), &q5, &path("q5"))
+                .bench
+                .verified
+        );
+        let q8 = q8_tables();
+        assert!(
+            run_q8(k(Q8Circuit::<Fp>::new(&q8).rows()), &q8, &path("q8"))
+                .bench
+                .verified
+        );
+        let q9 = q9_tables();
+        assert!(
+            run_q9(k(Q9Circuit::<Fp>::new(&q9).rows()), &q9, &path("q9"))
+                .bench
+                .verified
+        );
+        let q18 = q18_tables();
+        assert!(
+            run_q18(k(Q18Circuit::<Fp>::new(&q18).rows()), &q18, &path("q18"))
+                .bench
+                .verified
+        );
+    }
+
+    #[test]
+    fn q5_accepts_its_result_only() {
+        let circuit = Q5Circuit::<Fp>::new(&q5_tables());
+        let result = circuit.result();
+        let k = degree(circuit.rows());
+        let ok = |res: &[Vec<i128>]| {
+            MockProver::run(k, &circuit, transpose(res, 2))
+                .unwrap()
+                .verify()
+                .is_ok()
+        };
+        assert!(result.len() > 1, "too few groups to test with");
+        assert!(ok(&result));
+        let mut wrong = result.clone();
+        wrong[0][1] += 1;
         assert!(!ok(&wrong));
         assert!(!ok(&result[1..]));
     }
