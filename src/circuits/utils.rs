@@ -79,7 +79,7 @@ pub fn setup_params(k: u32) -> std::time::Duration {
     elapsed
 }
 
-pub fn full_prover<C: Circuit<Fp> + Sync>(
+pub fn full_prover<C: Circuit<Fp>>(
     circuit: C,
     k: u32,
     public_input: &[Fp],
@@ -121,50 +121,10 @@ fn binds(proof: &[u8], num_advice: usize, bound: &[(usize, G1Affine)]) -> bool {
     advice.is_ok_and(|advice| bound.iter().all(|&(i, c)| advice.get(i) == Some(&c)))
 }
 
-/// Pins the calling thread to `cpu`; threads it spawns inherit the pin.
-pub fn pin_to_cpu(cpu: usize) {
-    pin(&[cpu]);
-}
-
-fn pin(cpus: &[usize]) {
-    // SAFETY: `set` is a zeroed `cpu_set_t` that CPU_SET only writes into.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        for &cpu in cpus {
-            libc::CPU_SET(cpu, &mut set);
-        }
-        assert_eq!(
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
-            0,
-            "cannot pin to CPUs {cpus:?}"
-        );
-    }
-}
-
-/// Runs key generation on KEYGEN_THREADS threads over CPUs 0..KEYGEN_THREADS
-/// when that is set, else on the calling thread. Only key generation fans out:
-/// proving and verification stay on the calling thread's CPU.
-fn keygen<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    let Some(threads) = std::env::var("KEYGEN_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 1)
-    else {
-        return f();
-    };
-    let cpus: Vec<usize> = (0..threads).collect();
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .start_handler(move |_| pin(&cpus))
-        .build()
-        .expect("key generation thread pool")
-        .install(f)
-}
-
 /// [`full_prover`] for a circuit with one instance column per entry of
 /// `public_inputs`. The verifier also checks that the proof's advice columns
 /// of `bound` (column index, commitment) carry the data owner's commitments.
-pub fn full_prover_columns<C: Circuit<Fp> + Sync>(
+pub fn full_prover_columns<C: Circuit<Fp>>(
     circuit: C,
     k: u32,
     public_inputs: &[&[Fp]],
@@ -173,15 +133,14 @@ pub fn full_prover_columns<C: Circuit<Fp> + Sync>(
 ) -> BenchResult {
     let params = load_params(k);
 
-    let (vk_time, pk, pk_time) = keygen(|| {
-        let vk_time_start = Instant::now();
-        let vk = keygen_vk(&params, &circuit).unwrap();
-        let vk_time = vk_time_start.elapsed();
-        let pk_time_start = Instant::now();
-        let pk = keygen_pk(&params, vk, &circuit).unwrap();
-        (vk_time, pk, pk_time_start.elapsed())
-    });
+    let vk_time_start = Instant::now();
+    let vk = keygen_vk(&params, &circuit).unwrap();
+    let vk_time = vk_time_start.elapsed();
     println!("Time to generate vk {:?}", vk_time);
+
+    let pk_time_start = Instant::now();
+    let pk = keygen_pk(&params, vk, &circuit).unwrap();
+    let pk_time = pk_time_start.elapsed();
     println!("Time to generate pk {:?}", pk_time);
     let key_bytes = |write: &dyn Fn(&mut ByteCounter) -> std::io::Result<()>| {
         let mut counter = ByteCounter(0);

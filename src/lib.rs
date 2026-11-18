@@ -20,7 +20,7 @@ pub mod sql;
 /// Q3 typically uses `k - 1` (one smaller circuit) for the same dataset size.
 /// Callers are responsible for picking the right `k` per query.
 pub mod poneglyph_bench {
-    pub use crate::circuits::utils::{pin_to_cpu, setup_params, BenchResult};
+    pub use crate::circuits::utils::{setup_params, BenchResult};
     pub use halo2_proofs::halo2curves::bn256::Fr as Fp;
     pub use crate::sql::micro_kzg::{run as run_micro, supported as micro_supported, MicroResult};
     /// The data-independent TPC-H circuits, bound to the committed tables.
