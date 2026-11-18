@@ -7,6 +7,8 @@ edition = "2021"
 dev-graph = ["halo2_proofs/dev-graph", "plotters"]
 
 [dependencies]
+libc = "0.2"
+rayon = "1"
 halo2_proofs = { git = "https://github.com/tuzijun111/halo2_PSE", default-features = false}
 halo2_gadgets = { git = "https://github.com/tuzijun111/halo2_PSE"}
 # halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v2023_02_02", default-features = false}

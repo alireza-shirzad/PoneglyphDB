@@ -1864,7 +1864,7 @@ pub struct MicroResult {
 /// Proves and verifies `circuit`. With `table` (the circuit's table columns,
 /// its first advice columns), the data owner commits them first and the
 /// verifier checks the proof carries those commitments.
-fn prove<C: Circuit<Fp>>(
+fn prove<C: Circuit<Fp> + Sync>(
     circuit: C,
     k: u32,
     public: Vec<Vec<u64>>,
@@ -1883,7 +1883,7 @@ fn prove<C: Circuit<Fp>>(
 }
 
 /// [`prove`] for field-valued public inputs and table columns.
-pub(crate) fn prove_fields<C: Circuit<Fp>>(
+pub(crate) fn prove_fields<C: Circuit<Fp> + Sync>(
     circuit: C,
     k: u32,
     public: Vec<Vec<Fp>>,
