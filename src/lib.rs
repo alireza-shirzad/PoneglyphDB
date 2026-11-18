@@ -22,6 +22,9 @@ pub mod sql;
 pub mod poneglyph_bench {
     pub use crate::circuits::utils::{setup_params, BenchResult};
     pub use crate::sql::micro_kzg::{run as run_micro, supported as micro_supported, MicroResult};
+    /// The data-independent TPC-H circuits, bound to the committed tables.
+    pub use crate::sql::fixed_tpch as fixed;
+    pub use crate::sql::q1_fixed_kzg::{run as run_fixed_q1, Q1Circuit};
     pub use crate::sql::q18_final_kzg::run as run_q18;
     pub use crate::sql::q1_final_kzg::run as run_q1;
     pub use crate::sql::q3_final_kzg::run as run_q3;
