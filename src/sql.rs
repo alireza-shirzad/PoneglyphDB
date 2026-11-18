@@ -46,3 +46,4 @@ pub mod micro_kzg;
 pub mod test;
 pub mod test1;
 pub mod q1_fixed_kzg;
+pub mod fixed_tpch;
